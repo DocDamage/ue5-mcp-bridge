@@ -12,6 +12,7 @@
 #include "FMCPServer.h"
 #include "MCPTypes.h"
 #include "Tools/AssetRegistryTools.h"
+#include "Tools/ContentBrowserTools.h"
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -183,11 +184,12 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// Phase 2: Assets + Content Browser surface. Each Register function appends to
 	// RegisteredMethodNames so ShutdownModule can mirror-cleanup.
 	FAssetRegistryTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+	FContentBrowserTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	UE_LOG(LogMCP, Log,
 		TEXT("Registered dispatch handlers: kind=ExecPython → FMCPPythonEval::EvalExpression, ")
 		TEXT("unknown-method-fallback → FMCPPythonEval::CallPythonTool, ")
-		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13)"));
+		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12)"));
 }
 
 void FUnrealMCPBridgeModule::UnregisterDefaultDispatchHandlers()
