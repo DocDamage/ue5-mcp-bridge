@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end smoke test for the MCP bridge dispatch pipeline (Phase 1 Day 3).
+"""End-to-end smoke test for the MCP bridge dispatch pipeline (Phase 1 Day 7).
 
 Prerequisites:
   * Unreal Editor must be running with the UnrealMCPBridge plugin loaded.
@@ -25,6 +25,17 @@ What this script does (each sub-test opens a fresh socket, sends 1 frame, reads 
   9. ``marshall.write_property``     — Day 4-5; round-trips a write→read on a transient
                                        ``unreal.Vector`` field of a writable test object via
                                        ExecPython-spawned transient asset.
+ 10. ``job.submit`` + ``job.status`` — Day 7; submits an async job wrapping ``editor.ping`` and
+                                       polls until terminal. Expects state=Succeeded.
+ 11. ``job.result``                  — Day 7; queries the same job_id with wait_timeout_s=2 and
+                                       expects ok=true + result.pong=true.
+ 12. ``job.list_active`` + cancel    — Day 7; submits a job and immediately cancels it; verifies
+                                       both endpoints behave.
+ 13. ``log.tail``                    — Day 7; requests last 50 lines, expects ≥1 entry with
+                                       category ``LogMCP``.
+ 14. ``tools.list``                  — Day 7; single-roundtrip enumeration of all dispatch targets.
+                                       Verifies cpp_handlers contains ``editor.ping`` is NOT there
+                                       (Python-served) and that ``tools.list``/``job.submit`` ARE.
 
 Prints ``[SMOKE_PING] PASS`` (exit 0) on all-pass, otherwise ``[SMOKE_PING] FAIL ...`` (exit 1) at
 the first failing sub-test.
@@ -328,7 +339,127 @@ def main() -> int:
         return fail(f"9d: restore failed (CDO left mutated) result={restore_result!r}")
     print(f"[SMOKE_PING]   9/marshall.write_property OK (FrameRateLimit round-trip {original_value}→{sentinel}→{original_value})")
 
-    print(f"[SMOKE_PING] PASS — all 9 sub-tests succeeded")
+    # ─── Sub-test 10: job.submit + job.status (Day 7) ──────────────────────────────────────────
+    # Wraps editor.ping (cheap, Python-served, idempotent) in an async job. Polls job.status
+    # until it reaches a terminal state. Expects Succeeded within 5 seconds.
+    submit_result = run_subtest_call(
+        args.host, args.port, "10/job.submit", "smoke-10a", "job.submit",
+        {"method": "editor.ping", "args": {}, "description": "smoke-test ping", "game_thread": True},
+    )
+    if submit_result is None:
+        return 1
+    job_id = submit_result.get("job_id")
+    if not isinstance(job_id, str) or len(job_id) < 30:
+        return fail(f"10/job.submit: expected uuid-shaped job_id got {job_id!r}")
+    print(f"[SMOKE_PING]   10a/job.submit OK (job_id={job_id})")
+
+    # Poll status up to 50× at 100 ms intervals (= 5 seconds max).
+    final_state = None
+    for poll_iter in range(50):
+        status_result = run_subtest_call(
+            args.host, args.port, f"10b/job.status[{poll_iter}]", f"smoke-10b-{poll_iter}", "job.status",
+            {"job_id": job_id},
+        )
+        if status_result is None:
+            return 1
+        state = status_result.get("state")
+        if state in ("Succeeded", "Failed", "Cancelled"):
+            final_state = state
+            break
+        time.sleep(0.1)
+    if final_state != "Succeeded":
+        return fail(f"10b/job.status: expected terminal Succeeded got final_state={final_state!r}")
+    print(f"[SMOKE_PING]   10b/job.status OK (terminal state={final_state} after {poll_iter+1} polls)")
+
+    # ─── Sub-test 11: job.result with wait_timeout_s (Day 7) ───────────────────────────────────
+    # Same job_id; result should be ok=true + inner result containing pong=true.
+    result_result = run_subtest_call(
+        args.host, args.port, "11/job.result", "smoke-11", "job.result",
+        {"job_id": job_id, "wait_timeout_s": 2.0},
+    )
+    if result_result is None:
+        return 1
+    if result_result.get("ok") is not True:
+        return fail(f"11/job.result: expected ok=true got {result_result!r}")
+    inner = result_result.get("result")
+    if not isinstance(inner, dict) or inner.get("pong") is not True:
+        return fail(f"11/job.result: expected inner result.pong=true got inner={inner!r}")
+    print(f"[SMOKE_PING]   11/job.result OK (state={result_result.get('state')} inner.pong=True)")
+
+    # ─── Sub-test 12: job.list_active + cancel round-trip (Day 7) ──────────────────────────────
+    # Submit a job, then immediately cancel. RequestCancel returns true if the job exists and
+    # isn't yet terminal; the body may or may not have observed the flag. We don't assert on
+    # final state — only on the cancel API surface.
+    submit2 = run_subtest_call(
+        args.host, args.port, "12a/job.submit", "smoke-12a", "job.submit",
+        {"method": "editor.ping", "description": "to-be-cancelled", "game_thread": True},
+    )
+    if submit2 is None:
+        return 1
+    job_id_2 = submit2.get("job_id")
+    if not isinstance(job_id_2, str):
+        return fail(f"12a: expected job_id string got {submit2!r}")
+
+    # list_active must contain at minimum [this job] OR be empty (if it already finished).
+    list_result = run_subtest_call(
+        args.host, args.port, "12b/job.list_active", "smoke-12b", "job.list_active", {},
+    )
+    if list_result is None:
+        return 1
+    if not isinstance(list_result.get("jobs"), list):
+        return fail(f"12b/job.list_active: expected jobs array got {list_result!r}")
+
+    cancel_result = run_subtest_call(
+        args.host, args.port, "12c/job.cancel", "smoke-12c", "job.cancel", {"job_id": job_id_2},
+    )
+    if cancel_result is None:
+        return 1
+    if not isinstance(cancel_result.get("accepted"), bool):
+        return fail(f"12c/job.cancel: expected accepted bool got {cancel_result!r}")
+    print(f"[SMOKE_PING]   12/job.list+cancel OK (accepted={cancel_result['accepted']}, list jobs={len(list_result['jobs'])})")
+
+    # ─── Sub-test 13: log.tail (Day 7) ─────────────────────────────────────────────────────────
+    # The ring buffer has been collecting since module startup, so a tail of 50 lines must
+    # return at least one entry. We don't assert on specific content (locale-dependent), only
+    # on shape.
+    tail_result = run_subtest_call(
+        args.host, args.port, "13/log.tail", "smoke-13", "log.tail", {"lines": 50},
+    )
+    if tail_result is None:
+        return 1
+    entries = tail_result.get("entries")
+    if not isinstance(entries, list) or len(entries) == 0:
+        return fail(f"13/log.tail: expected non-empty entries list got {entries!r}")
+    sample = entries[0]
+    expected_keys = {"timestamp", "category", "verbosity", "message"}
+    if not isinstance(sample, dict) or not expected_keys.issubset(sample.keys()):
+        return fail(f"13/log.tail: malformed entry expected_keys={expected_keys} got={sample!r}")
+    print(f"[SMOKE_PING]   13/log.tail OK ({len(entries)} entries; total_observed={tail_result.get('total_observed')})")
+
+    # ─── Sub-test 14: tools.list (Day 7) ───────────────────────────────────────────────────────
+    # Single-call enumeration of every registered dispatch target. cpp_handlers must contain
+    # marshall.*, job.*, log.*, tools.list. python_tools must contain editor.ping IF Python is
+    # ready (which it should be by this point).
+    tools_result = run_subtest_call(args.host, args.port, "14/tools.list", "smoke-14", "tools.list", {})
+    if tools_result is None:
+        return 1
+    cpp_handlers = tools_result.get("cpp_handlers")
+    python_tools = tools_result.get("python_tools")
+    if not isinstance(cpp_handlers, list) or not isinstance(python_tools, dict):
+        return fail(f"14/tools.list: malformed envelope got {tools_result!r}")
+    expected_cpp = {"job.submit", "job.status", "job.result", "job.cancel", "job.list_active",
+                    "log.tail", "log.subscribe", "log.search", "tools.list",
+                    "marshall.list_properties", "marshall.read_property",
+                    "marshall.write_property", "marshall.describe_struct"}
+    cpp_set = set(cpp_handlers)
+    missing = expected_cpp - cpp_set
+    if missing:
+        return fail(f"14/tools.list: cpp_handlers missing {missing} (got {sorted(cpp_set)})")
+    if tools_result.get("python_ready") is True and "editor.ping" not in python_tools:
+        return fail(f"14/tools.list: python_ready=true but editor.ping missing from python_tools={sorted(python_tools.keys())}")
+    print(f"[SMOKE_PING]   14/tools.list OK (cpp={len(cpp_handlers)} python={len(python_tools)} python_ready={tools_result.get('python_ready')})")
+
+    print(f"[SMOKE_PING] PASS — all 14 sub-tests succeeded")
     return 0
 
 

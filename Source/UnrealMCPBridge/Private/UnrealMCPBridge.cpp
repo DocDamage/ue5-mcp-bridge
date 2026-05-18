@@ -2,7 +2,10 @@
 
 #include "UnrealMCPBridge.h"
 
+#include "FMCPDay7Handlers.h"
 #include "FMCPDispatchQueue.h"
+#include "FMCPJobRegistry.h"
+#include "FMCPLogStream.h"
 #include "FMCPMarshalling.h"
 #include "FMCPPythonBootstrap.h"
 #include "FMCPPythonEval.h"
@@ -17,7 +20,7 @@ DEFINE_LOG_CATEGORY(LogMCP);
 
 void FUnrealMCPBridgeModule::StartupModule()
 {
-	UE_LOG(LogMCP, Log, TEXT("MCP bridge module starting (Phase 1 Day 3 — Python tool dispatch)"));
+	UE_LOG(LogMCP, Log, TEXT("MCP bridge module starting (Phase 1 Day 7 — async jobs + log streaming + tools.list)"));
 
 	// 1. Open the TCP listener. Failure here does not abort module load; we log + continue so the
 	//    user can MCP.RestartListener after fixing the port conflict.
@@ -29,28 +32,33 @@ void FUnrealMCPBridgeModule::StartupModule()
 			*StartErr);
 	}
 
-	// 2. Register Python eval bridge handlers. These self-check IsPythonInitialized() and return
+	// 2. Attach the GLog ring-buffer capture BEFORE we log anything else from this point on, so
+	//    the buffer reflects the full module-startup history. AddOutputDevice is idempotent
+	//    (see FMCPLogStream::Attach).
+	FMCPLogStream::Get().Attach();
+
+	// 3. Register Python eval bridge handlers. These self-check IsPythonInitialized() and return
 	//    structured -32603 errors if Python isn't up, so installing eagerly (before Python init)
 	//    is safe — early requests just get a deterministic "python not initialised" surface.
 	//
-	//    Day 2 had a hard-coded C++ editor.ping handler here; Day 3 deletes it because Python
-	//    serves editor.ping via the @tool decorator in smoke_tools.py. Dispatch precedence is:
+	//    Dispatch precedence is:
 	//        (kind=ExecPython?) → ExecPythonHandler
-	//        else (Method ∈ C++ handler map?) → C++ handler
+	//        else (Method ∈ C++ handler map?) → C++ handler  (marshall.*, job.*, log.*, tools.list)
 	//        else (UnknownMethodFallback installed?) → Python registry lookup
 	//        else → -32601 method not found
 	RegisterDefaultDispatchHandlers();
 
-	// 3. Hook the OnEndFrame drain.
+	// 4. Hook the OnEndFrame drain.
 	OnEndFrameHandle = FCoreDelegates::OnEndFrame.AddRaw(this, &FUnrealMCPBridgeModule::OnEndFrame);
 
-	// 4. Python sys.path bootstrap — fires immediately if Python is already up, else queues.
+	// 5. Python sys.path bootstrap — fires immediately if Python is already up, else queues.
 	FMCPPythonBootstrap::RegisterPythonInitCallback();
 
 	bStarted = true;
-	UE_LOG(LogMCP, Log, TEXT("MCP bridge module ready (listener=%s port=%d)"),
+	UE_LOG(LogMCP, Log, TEXT("MCP bridge module ready (listener=%s port=%d, log_stream=%s)"),
 		FMCPServer::Get().IsListening() ? TEXT("RUNNING") : TEXT("STOPPED"),
-		FMCPServer::Get().GetListenPort());
+		FMCPServer::Get().GetListenPort(),
+		FMCPLogStream::Get().GetEntryCount() > 0 ? TEXT("ATTACHED") : TEXT("ATTACHED_EMPTY"));
 }
 
 void FUnrealMCPBridgeModule::ShutdownModule()
@@ -65,9 +73,18 @@ void FUnrealMCPBridgeModule::ShutdownModule()
 
 	UnregisterDefaultDispatchHandlers();
 
-	// Tear the listener down LAST so any in-flight response from a Drain caught before us can still
-	// be sent (defensive — we already unregistered OnEndFrame so this is mostly cosmetic).
+	// Stop accepting new socket traffic FIRST so no fresh job.submit calls land while we're tearing
+	// the registry down.
 	FMCPServer::Get().Stop();
+
+	// Cancel any in-flight async jobs + destroy the worker pool. Bodies that don't honour cancel
+	// will still run to completion — pool->Destroy() blocks. That's intentional (forced abort of
+	// in-progress Python could corrupt the interpreter).
+	FMCPJobRegistry::Get().Shutdown();
+
+	// Detach log capture LAST so any teardown logs from Job registry / server get into the ring
+	// for the final flush (cosmetic — by now nobody can query log.tail anyway).
+	FMCPLogStream::Get().Detach();
 
 	bStarted = false;
 }
@@ -134,20 +151,38 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// precedence over the Python fallback for ``marshall.*`` — see dispatch order in
 	// FMCPDispatchQueue::Drain. FHandler is a TFunction so we can pass the static method pointer
 	// directly — TFunction's converting ctor wraps it.
-	auto RegisterMarshall = [this](const TCHAR* MethodName, FMCPDispatchQueue::FHandler Handler)
+	auto RegisterHandler = [this](const TCHAR* MethodName, FMCPDispatchQueue::FHandler Handler)
 	{
 		FMCPDispatchQueue::Get().RegisterHandler(MethodName, MoveTemp(Handler));
 		RegisteredMethodNames.Add(MethodName);
 	};
-	RegisterMarshall(TEXT("marshall.list_properties"), &FMCPMarshalling::ListProperties);
-	RegisterMarshall(TEXT("marshall.read_property"),   &FMCPMarshalling::ReadProperty);
-	RegisterMarshall(TEXT("marshall.write_property"),  &FMCPMarshalling::WriteProperty);
-	RegisterMarshall(TEXT("marshall.describe_struct"), &FMCPMarshalling::DescribeStruct);
+	RegisterHandler(TEXT("marshall.list_properties"), &FMCPMarshalling::ListProperties);
+	RegisterHandler(TEXT("marshall.read_property"),   &FMCPMarshalling::ReadProperty);
+	RegisterHandler(TEXT("marshall.write_property"),  &FMCPMarshalling::WriteProperty);
+	RegisterHandler(TEXT("marshall.describe_struct"), &FMCPMarshalling::DescribeStruct);
+
+	// Day 7: async job system (5 handlers). Bodies dispatch to a separate worker pool — the
+	// handlers themselves are synchronous and bounded.
+	RegisterHandler(TEXT("job.submit"),      &FMCPDay7Handlers::JobSubmit);
+	RegisterHandler(TEXT("job.status"),      &FMCPDay7Handlers::JobStatus);
+	RegisterHandler(TEXT("job.result"),      &FMCPDay7Handlers::JobResult);
+	RegisterHandler(TEXT("job.cancel"),      &FMCPDay7Handlers::JobCancel);
+	RegisterHandler(TEXT("job.list_active"), &FMCPDay7Handlers::JobListActive);
+
+	// Day 7: log streaming (3 handlers). FMCPLogStream is attached to GLog at module startup so
+	// every log line since then is queryable via these handlers.
+	RegisterHandler(TEXT("log.tail"),      &FMCPDay7Handlers::LogTail);
+	RegisterHandler(TEXT("log.subscribe"), &FMCPDay7Handlers::LogSubscribe);
+	RegisterHandler(TEXT("log.search"),    &FMCPDay7Handlers::LogSearch);
+
+	// Day 7: first-class tools.list verb. Replaces mcp_server's exec_python ferry — returns
+	// {python_tools: {meta...}, cpp_handlers: [names]} in a single round-trip.
+	RegisterHandler(TEXT("tools.list"), &FMCPDay7Handlers::ToolsList);
 
 	UE_LOG(LogMCP, Log,
 		TEXT("Registered dispatch handlers: kind=ExecPython → FMCPPythonEval::EvalExpression, ")
 		TEXT("unknown-method-fallback → FMCPPythonEval::CallPythonTool, ")
-		TEXT("C++ handlers → marshall.list_properties / read_property / write_property / describe_struct"));
+		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list"));
 }
 
 void FUnrealMCPBridgeModule::UnregisterDefaultDispatchHandlers()
