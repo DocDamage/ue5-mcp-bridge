@@ -69,6 +69,14 @@ public class UnrealMCPBridge : ModuleRules
 				"MaterialEditor",           // UMaterialEditingLibrary (material.* parameter IO).
 				"RHI",                      // GMaxRHIShaderPlatform (material.get_compile_errors).
 				                            // (GShaderCompilingManager is ENGINE_API — already linked.)
+				// Phase 5 Chunk B — Editor utilities surface.
+				// LevelEditor already listed above (Phase 3). Slate + SlateCore needed for
+				// FSlateNotificationManager (editor.show_message) + SLevelViewport access
+				// (editor.viewport_screenshot active-viewport resolution).
+				"Slate",                    // FSlateNotificationManager, SNotificationItem
+				"SlateCore",                // FNotificationInfo, slate enums
+				// ImageWrapper already listed (Phase 2) — reused by FMCPScreenshotUtils for
+				// PNG/JPG encode via FImageUtils::CompressImage.
 			}
 		);
 	}

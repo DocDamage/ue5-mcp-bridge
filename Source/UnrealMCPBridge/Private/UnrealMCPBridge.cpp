@@ -18,6 +18,7 @@
 #include "Tools/BlueprintTools.h"
 #include "Tools/ComponentTools.h"
 #include "Tools/ContentBrowserTools.h"
+#include "Tools/EditorTools.h"
 #include "Tools/LevelCompositeTools.h"
 #include "Tools/LevelTools.h"
 #include "Tools/MaterialTools.h"
@@ -247,10 +248,19 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// (get_player_controller/get_pawn/focus_actor).
 	FPIETools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
+	// Phase 5 Chunk B: Editor utilities surface (10 tools, all Lane A). Viewport screenshots
+	// (in-memory + disk for editor + PIE) + camera get/set + world-outliner selection get/set +
+	// toast notification + current-world identity + force-one-tick. The one PIE-required tool
+	// (pie.screenshot_to_disk) lives in the pie.* namespace for surface coherence even though
+	// it's registered alongside the editor.* tools in this chunk. Path-based outputs go through
+	// FMCPPathSandbox::Resolve → -32013 PathEscape on whitelist miss; set_selection caps at 200
+	// (-32017 InputTooLarge) mirroring Phase 2 batch_metadata.
+	FEditorTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
 	UE_LOG(LogMCP, Log,
 		TEXT("Registered dispatch handlers: kind=ExecPython → FMCPPythonEval::EvalExpression, ")
 		TEXT("unknown-method-fallback → FMCPPythonEval::CallPythonTool, ")
-		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12) + asset._internal (5) + level.* (12) + actor.* (20) + component.* (8) + level._internal/actor._internal (5) + bp.* (13) + bp._internal (1) + material.* (9) + pie.* (10) + _phase3_lane_b_sanity (1)"));
+		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12) + asset._internal (5) + level.* (12) + actor.* (20) + component.* (8) + level._internal/actor._internal (5) + bp.* (13) + bp._internal (1) + material.* (9) + pie.* (10) + editor.* (9) + pie.screenshot_to_disk + _phase3_lane_b_sanity (1)"));
 }
 
 void FUnrealMCPBridgeModule::UnregisterDefaultDispatchHandlers()
