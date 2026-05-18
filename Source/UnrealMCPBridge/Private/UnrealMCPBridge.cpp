@@ -20,6 +20,7 @@
 #include "Tools/ContentBrowserTools.h"
 #include "Tools/LevelCompositeTools.h"
 #include "Tools/LevelTools.h"
+#include "Tools/MaterialTools.h"
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -233,10 +234,15 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// Cooperative cancel every 16 BPs (heavier than Phase 3 default 256 because compile is heavy).
 	FBlueprintCompositeTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
+	// Phase 4 Days 11-15: Material surface (9 tools, all Lane A). 2 reads + 4 MIC writes +
+	// 1 create + 2 diagnostic. Reads PIE-safe; writes refuse PIE with -32027. MIC-only writes
+	// enforced — base UMaterial mutations would need graph edits (out of Phase 4 scope).
+	FMaterialTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
 	UE_LOG(LogMCP, Log,
 		TEXT("Registered dispatch handlers: kind=ExecPython → FMCPPythonEval::EvalExpression, ")
 		TEXT("unknown-method-fallback → FMCPPythonEval::CallPythonTool, ")
-		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12) + asset._internal (5) + level.* (12) + actor.* (20) + component.* (8) + level._internal/actor._internal (5) + bp.* (13) + bp._internal (1) + _phase3_lane_b_sanity (1)"));
+		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12) + asset._internal (5) + level.* (12) + actor.* (20) + component.* (8) + level._internal/actor._internal (5) + bp.* (13) + bp._internal (1) + material.* (9) + _phase3_lane_b_sanity (1)"));
 }
 
 void FUnrealMCPBridgeModule::UnregisterDefaultDispatchHandlers()

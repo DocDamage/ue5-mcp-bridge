@@ -7,14 +7,15 @@ the editor for asset/level/blueprint authoring tasks.
 
 ## Status
 
-**Phase 3 complete — 92 user-visible tools + 10 internal hidden handlers.**
+**Phase 4 complete — 115 user-visible tools + 11 internal hidden handlers.**
 
 | Phase | Tools | Surface |
 |---|---|---|
 | Phase 1 | 16 | marshall.* (4), job.* (5), log.* (3), tools.list, editor.* (3) |
 | Phase 2 | 31 | asset.* (13 C++ + 6 Python composites = 19), cb.* (12) — plus 5 internal hidden handlers |
 | Phase 3 | 45 | level.* (12), actor.* (20), component.* (8), composites (5 user-visible Python) — plus 5 internal hidden C++ handlers |
-| **Total** | **92** | (user-visible; 102 total handler registrations counting hidden internals) |
+| Phase 4 | 23 | bp.* (13 C++ + 1 Python composite = 14), material.* (9) — plus 1 internal hidden C++ handler |
+| **Total** | **115** | (user-visible; 126 total handler registrations counting hidden internals) |
 
 ### Phase 3 polish round (2026-05) — 5 known issues addressed
 
@@ -109,32 +110,39 @@ UnrealMCPBridge/
     Private/
       UnrealMCPBridge.cpp, FMCPConnection.cpp, FMCPServer.cpp, ...
       Tools/
-        AssetRegistryTools.h/.cpp   # Phase 2 Category A — 13 AR reads (all Lane A post-hotfix; was 10 Lane B)
-        ContentBrowserTools.h/.cpp  # Phase 2 Category B — 12 CB writes (all Lane A; list_folders was Lane B)
-        AssetCompositeTools.h/.cpp  # Phase 2 Category D — 5 internal C++ helpers (all Lane B, all async-job)
-        LevelTools.h/.cpp           # Phase 3 Category A — 12 level.* tools + 1 hidden Lane B probe
-        ActorTools.h/.cpp           # Phase 3 Category B — 20 actor.* tools (all Lane A)
-        ComponentTools.h/.cpp       # Phase 3 Category C — 8 component.* tools (all Lane A)
-        LevelCompositeTools.h/.cpp  # Phase 3 Category D — 5 internal C++ submitters (Lane B, async-job)
+        AssetRegistryTools.h/.cpp     # Phase 2 Category A — 13 AR reads (all Lane A post-hotfix; was 10 Lane B)
+        ContentBrowserTools.h/.cpp    # Phase 2 Category B — 12 CB writes (all Lane A; list_folders was Lane B)
+        AssetCompositeTools.h/.cpp    # Phase 2 Category D — 5 internal C++ helpers (all Lane B, all async-job)
+        LevelTools.h/.cpp             # Phase 3 Category A — 12 level.* tools + 1 hidden Lane B probe
+        ActorTools.h/.cpp             # Phase 3 Category B — 20 actor.* tools (all Lane A)
+        ComponentTools.h/.cpp         # Phase 3 Category C — 8 component.* tools (all Lane A)
+        LevelCompositeTools.h/.cpp    # Phase 3 Category D — 5 internal C++ submitters (Lane B, async-job)
+        BlueprintTools.h/.cpp         # Phase 4 Days 1-10 — 13 bp.* tools (6 reads + 6 writes + bp.compile)
+        BlueprintCompositeTools.h/.cpp # Phase 4 Day 10 — 1 internal Lane B submitter (bp.compile_all_dirty)
+        MaterialTools.h/.cpp          # Phase 4 Days 11-15 — 9 material.* tools (reads + MIC writes + create + diagnostic)
       Utils/                                # Unified utility namespace post-polish #11
-        MCPAssetPathUtils.h/.cpp    # Phase 2 — asset path canonicalisation
-        MCPARFilterParser.h/.cpp    # Phase 2 — FARFilter JSON ↔ struct + hash
-        MCPPageCursor.h/.cpp        # Phase 2 — opaque sentinel cursor (also used by Phase 3)
-        MCPPathSandbox.h/.cpp       # Phase 2 — disk-path whitelist guard
-        MCPReflection.h/.cpp        # Phase 3 Day 0 — FProperty read/write helpers + FMCPWritePropertyScope RAII
-        MCPWorldContext.h/.cpp      # Phase 3 — GetEditorWorld / IsPIEActive / ResolveLevelByMapPath
-        MCPActorPathUtils.h/.cpp    # Phase 3 — ParseActorPath / BuildActorPath / ResolveActor
+        MCPAssetPathUtils.h/.cpp     # Phase 2 — asset path canonicalisation
+        MCPARFilterParser.h/.cpp     # Phase 2 — FARFilter JSON ↔ struct + hash
+        MCPPageCursor.h/.cpp         # Phase 2 — opaque sentinel cursor (also used by Phase 3 + 4)
+        MCPPathSandbox.h/.cpp        # Phase 2 — disk-path whitelist guard
+        MCPReflection.h/.cpp         # Phase 3 Day 0 — FProperty read/write helpers + FMCPWritePropertyScope RAII
+        MCPWorldContext.h/.cpp       # Phase 3 — GetEditorWorld / IsPIEActive / ResolveLevelByMapPath
+        MCPActorPathUtils.h/.cpp     # Phase 3 — ParseActorPath / BuildActorPath / ResolveActor
         MCPComponentPathUtils.h/.cpp # Phase 3 — ResolveComponent (with ambiguity detection)
         MCPPropertyPathParser.h/.cpp # Phase 3 — dotted path + array-index parser
+        MCPBlueprintUtils.h/.cpp     # Phase 4 — LoadBlueprintByPath / FindVariableIndex / GetGeneratedClass
+        MCPPinTypeUtils.h/.cpp       # Phase 4 — FEdGraphPinType ↔ JSON (D3/D4 — fail-fast on unsupported)
+        MCPMaterialUtils.h/.cpp      # Phase 4 — LoadMaterialInterfaceByPath / LoadMICByPath / WalkToBaseMaterial
   Content/Python/MCPTools/
     registry.py     # @tool decorator (with _internal=True filter); Phase 1 polish #12 wraps
                     # tool body with try/except → translates Python exceptions to JSON-RPC errors
     marshall.py     # Tier 1 type marshalling
     tools/
-      smoke_tools.py       # editor.ping demo
-      asset_tools.py       # Shared helpers for Phase 2 composites
-      asset_composites.py  # Phase 2 — 6 Category D Python composites
-      level_composites.py  # Phase 3 — 5 Category D Python composites (level/actor batch ops)
+      smoke_tools.py         # editor.ping demo
+      asset_tools.py         # Shared helpers for Phase 2 composites
+      asset_composites.py    # Phase 2 — 6 Category D Python composites
+      level_composites.py    # Phase 3 — 5 Category D Python composites (level/actor batch ops)
+      blueprint_composites.py # Phase 4 — 1 Category C Python composite (bp.compile_all_dirty)
   Tests/
     smoke_ping.py                # Phase 1 14-subtest smoke
     smoke_phase2.py              # Phase 2 34-subtest smoke
@@ -143,6 +151,10 @@ UnrealMCPBridge/
     smoke_phase3_days_4_8.py     # Phase 3 — 20 actor.* tools (22 sub-tests)
     smoke_phase3_days_9_10.py    # Phase 3 — 8 component.* tools
     smoke_phase3_days_11_14.py   # Phase 3 — 5 composite tools (9 sub-tests)
+    smoke_phase4.py              # Phase 4 wrapper — runs all 3 Days sub-suites and aggregates
+    smoke_phase4_days_1_5.py     # Phase 4 — 6 bp.* read tools
+    smoke_phase4_days_6_10.py    # Phase 4 — 6 bp.* writes + bp.compile + bp.compile_all_dirty
+    smoke_phase4_days_11_15.py   # Phase 4 — 9 material.* tools (reads + MIC writes + create + diagnostic)
     lane_b_spike.py              # Phase 2 Day 0 Lane B audit harness
 ```
 
@@ -393,6 +405,193 @@ silently time out instead of returning the proper error).
 The `-32027 PIEActive` message is **frozen** — smoke tests assert both substrings `"Phase 5"`
 and `"pie."` so any client UI can rely on stable wording.
 
+## Phase 4 tool catalogue (23 user-visible tools + 1 hidden internal)
+
+Breakdown: **13 C++ bp.*** + **1 Python composite bp.*** + **9 C++ material.*** = 23 user-visible
+tools, plus **1 internal hidden** `bp._compile_all_dirty_internal` Lane B submitter used by the
+Python composite.
+
+All 23 tools are **Lane A** (game thread). Writes refuse PIE with `-32027`; reads are PIE-safe
+(assets are shared between editor and PIE worlds). No World Partition check (asset-namespace
+tools don't traverse map data).
+
+### Category A — Blueprint reads (6 tools, all Lane A, no PIE guard)
+
+```
+bp.exists                 → {exists, generated_class_path, parent_class_path, is_data_only}
+bp.list_variables         → {variables[{name, pin_type, default_value, category_group, ...}], next_page_token, total_known}
+bp.get_variable           → {variable: { name, pin_type, default_value, replicated, ... }}
+bp.list_functions         → {functions[{name, category, access_specifier, signature{inputs, outputs}, ...}], next_page_token, total_known}
+bp.get_function           → {function: {..., local_variables[], execution_path_node_count}}
+bp.list_nodes_in_function → {nodes[{node_guid, class, title, pins[{name, direction, pin_type, connected_to[]}]}], next_page_token, total_known}
+```
+
+Pagination is sentinel-cursor (FMCPPageCursor) over a stable sort by variable name / function name
+/ node GUID string. Mid-pagination blueprint swap → `-32015 StaleCursor`. Unsupported pin types
+(e.g. PC_Verse, future Epic-added categories) fail fast with `-32032 PinTypeUnsupported` rather
+than silently coercing to a lossy PC_String fallback (D4).
+
+### Category B — Blueprint writes (6 tools, all Lane A, PIE-guarded)
+
+```
+bp.add_variable          → {added, variable_name}                        edit-const-gate carve-out
+bp.remove_variable       → {removed, was_present}                        idempotent
+bp.change_variable_type  → {changed, prior_pin_type, warning}            warning text describes invalidation risk
+bp.add_function          → {added, function_name}                        UserDefinedPins for inputs/outputs
+bp.remove_function       → {removed, was_present}
+bp.reparent              → {reparented, prior_parent, lost_variables[], lost_functions[]}
+                                                                          experimental + confirm_dangerous=true gate
+```
+
+`bp.add_variable` deliberately SKIPS the standard edit-const 3-flag gate (CLAUDE D7 carve-out) —
+new BP variables ship with `CPF_DisableEditOnInstance | CPF_BlueprintVisible | CPF_Edit` by
+default, so applying the gate to the freshly-created variable would false-positive every add.
+The gate is reserved for the future `bp.set_variable_default` tool.
+
+`bp.reparent` requires `args.confirm_dangerous=true` (literal bool); omission returns
+`-32033 ReparentUnsafe`. The frozen advisory text mentions "confirm_dangerous" + "may invalidate
+variables/functions inherited from prior parent class". Every successful reparent emits a Display
+log line with old/new parent paths + lost-member counts.
+
+### Category C — Blueprint build (2 tools)
+
+```
+bp.compile          → {compiled, errors[], warnings[], duration_ms, status}      Lane A sync, PIE-guarded
+bp.compile_all_dirty → {job_id}  → bp._compile_all_dirty_internal               Lane B submitter + GT body
+                                                                                  ↓
+                                                                                 (poll job.result)
+                                                                                  ↓
+                                                                                 {compiled, succeeded, failed[{path, errors[]}], duration_ms}
+```
+
+`bp.compile`'s `fail_on_error=true` (default false) returns `-32030 KismetCompilationError`
+embedding the same `{errors, warnings, duration_ms, status}` payload, so AI strict-mode callers
+can short-circuit without re-running.
+
+`bp.compile_all_dirty` is the lone Phase 4 async composite. Python wrapper validates
+`scope_paths` (non-empty `/Game/...` list — empty raises `ValueError` → `-32602`). Cooperative
+cancel cadence is 16 BPs (lower than Phase 3's 256 because compile is heavier). Failure
+aggregation policy (D1): continue + aggregate — does NOT abort on first failure. AI workflow
+sees the full failure surface in one round-trip.
+
+### Category D — Material reads (2 tools, all Lane A, no PIE guard)
+
+```
+material.list_parameters → {parameters: {scalar[{name, default, value, group}], vector[...], texture[{name, default_path, value_path, group}], static_switch[{name, default, value}]},
+                            source_class, next_page_token?, total_known}
+material.get_parameter   → {found, type, value, default, group}
+```
+
+`material.list_parameters` paginates over the FLATTENED list (scalar → vector → texture →
+static_switch, sorted lex within each category). `material.get_parameter` auto-detects type via
+4-way search (scalar → vector → texture → static_switch — first match wins); `parameter_type`
+arg short-circuits to a single category. Missing parameter → `-32036 ParameterNotFound`.
+
+`group` field is empty string in Phase 4 — `FMaterialParameterInfo` does not surface a
+per-parameter group through the public UE 5.7 API. Marked optional in the wire schema; a future
+material.* extension may populate via UMaterialEditorInstanceConstant walk.
+
+### Category E — Material writes (4 tools, all Lane A, PIE-guarded, MIC-only)
+
+```
+material.set_scalar_param   → {applied, prior_value}
+material.set_vector_param   → {applied, prior_value: {r,g,b,a}}
+material.set_texture_param  → {applied, prior_value: <path|"">}
+material.set_static_switch  → {applied, prior_value, recompile_triggered: true, recompile_already_pending: bool}
+```
+
+All 4 enforce MIC-only writes via `FMCPMaterialUtils::LoadMICByPath`. Base UMaterial paths
+return `-32034 MaterialClassMismatch` with the standard advisory: "expected
+UMaterialInstanceConstant ... mutating base UMaterial requires graph edits (out of Phase 4 scope;
+future Phase 7 may add material.edit_node)".
+
+Every write site applies the canonical 3-flag edit-const gate
+(`CPF_EditConst | CPF_BlueprintReadOnly | CPF_DisableEditOnInstance`) on the override-array
+FProperty; gate bypass via `args.bypass_readonly=true`. Writes are wrapped in
+`FMCPWritePropertyScope` (RAII Pre/Modify/Transaction/Post).
+
+`material.set_static_switch` additionally checks
+`GShaderCompilingManager->GetNumRemainingJobs() < 1000` (CVar `mcp.material.shader_queue_soft_limit`
+reserved for future tunability); queue saturation → `-32035 ShaderRecompilePending`. The result
+carries `recompile_triggered=true` AND `recompile_already_pending: bool` so callers can decide
+whether the recompile is a fresh trigger or appending to existing work.
+
+### Category F — Material create + diagnostic (3 tools, all Lane A)
+
+```
+material.create_instance      → {created, mic_path}                      PIE-guarded
+material.is_shader_compiling  → {compiling: bool, remaining_jobs: int}   no PIE guard
+material.get_compile_errors   → {has_errors, errors[], warnings[]}       no PIE guard
+```
+
+`material.create_instance` uses `UMaterialInstanceConstantFactoryNew` + `IAssetTools::CreateAsset`.
+Conflict check via `FPackageName::DoesPackageExist(dest_path)` → `-32014 PathInUse` (D10 — reuses
+Phase 2 error code). Caller can `cb.delete` then retry or pick new path. Post-create the asset
+gets `SetParentEditorOnly(ParentMaterial)` + `PostEditChangeProperty` so it's immediately usable
+for parameter overrides on the same tick.
+
+`material.is_shader_compiling` is a trivial pass-through of `GShaderCompilingManager` state — no
+mutation, safe under any editor condition. `material.get_compile_errors` walks the MIC parent
+chain to the base UMaterial then reads `FMaterialResource::GetCompileErrors()` from
+`Material->GetMaterialResource(GMaxRHIShaderPlatform)`. Warnings array is reserved (UE 5.7's
+FMaterialResource does not surface compile-time warnings separately).
+
+### Phase 4 error codes (-32030..-32037)
+
+8 new error codes were added in Phase 4:
+
+```
+-32030 KismetCompilationError    bp.compile fail_on_error=true — compile produced errors (same payload embedded)
+-32031 BlueprintTypeMismatch     bp.* — path resolved to non-UBlueprint asset
+-32032 PinTypeUnsupported        bp.* variable/function pin IO — PC_* category not handled (fail-fast per D4)
+-32033 ReparentUnsafe            bp.reparent — caller omitted confirm_dangerous=true
+-32034 MaterialClassMismatch     material.* — path resolved to wrong material-class family (e.g. UMaterial for a write)
+-32035 ShaderRecompilePending    material.set_static_switch — queue at or above soft cap (default 1000 jobs)
+-32036 ParameterNotFound         material.{get,set}_*_param — parameter name not on the resolved material
+-32037 VariableNotFound          bp.{get,remove,change}_variable / bp.{get,remove}_function — name missing
+```
+
+### Phase 4 example: MIC scalar override + shader recompile poll
+
+```jsonc
+// 1. Read current value
+{"id":"r1","kind":"call_function","method":"material.get_parameter",
+ "args":{"material_path":"/Game/MyMaterials/MI_HeroLighting", "parameter_name":"Brightness"}}
+// → {"ok":true, "result":{"found":true, "type":"scalar", "value":1.0, "default":1.0, "group":""}}
+
+// 2. Write a new value
+{"id":"w1","kind":"call_function","method":"material.set_scalar_param",
+ "args":{"material_path":"/Game/MyMaterials/MI_HeroLighting", "parameter_name":"Brightness", "value":2.5}}
+// → {"ok":true, "result":{"applied":true, "prior_value":1.0}}
+
+// 3. Flip a static switch — triggers async shader recompile
+{"id":"s1","kind":"call_function","method":"material.set_static_switch",
+ "args":{"material_path":"/Game/MyMaterials/MI_HeroLighting", "parameter_name":"UseAlbedoMask", "value":true}}
+// → {"ok":true, "result":{"applied":true, "prior_value":false,
+//                          "recompile_triggered":true, "recompile_already_pending":false}}
+
+// 4. Poll until shaders done
+{"id":"c1","kind":"call_function","method":"material.is_shader_compiling", "args":{}}
+// → {"ok":true, "result":{"compiling":true, "remaining_jobs":47}}
+// (poll again until compiling=false)
+```
+
+### Phase 4 example: async batch-compile
+
+```jsonc
+// 1. Submit (Python wrapper handles ValueError → -32602 for empty scope_paths)
+{"id":"bc1","kind":"call_function","method":"bp.compile_all_dirty",
+ "args":{"scope_paths":["/Game/Characters"], "fail_fast":false}}
+// → {"ok":true, "result":{"job_id":"abc-def-..."}}
+
+// 2. Poll
+{"id":"bc2","kind":"call_function","method":"job.result",
+ "args":{"job_id":"abc-def-...", "wait_timeout_s":30}}
+// → {"ok":true, "result":{"state":"Succeeded",
+//      "result":{"compiled":42, "succeeded":40, "failed":[{"path":"/Game/.../BP_X", "errors":["..."]}],
+//                "duration_ms":12345.6}}}
+```
+
 ## Common patterns
 
 ### `cb.move_with_redirector_cleanup` (2-line recipe — no separate tool)
@@ -516,6 +715,10 @@ listener up (loopback port 30020 by default).
 | `smoke_phase3_days_4_8.py` | 22 | Phase 3 Days 4-8 — 20 `actor.*` tools |
 | `smoke_phase3_days_9_10.py` | 9 | Phase 3 Days 9-10 — 8 `component.*` tools |
 | `smoke_phase3_days_11_14.py` | 9 | Phase 3 Days 11-14 — 5 composite tools (full_actor_dump, batch_spawn, ...) |
+| `smoke_phase4.py` | **wrapper** | Runs all 3 Phase 4 sub-suites below and aggregates pass/fail |
+| `smoke_phase4_days_1_5.py` | 14 | Phase 4 Days 1-5 — 6 `bp.*` read tools (exists/list/get) + pagination |
+| `smoke_phase4_days_6_10.py` | 19 | Phase 4 Days 6-10 — 6 `bp.*` writes + `bp.compile` + `bp.compile_all_dirty` |
+| `smoke_phase4_days_11_15.py` | 17 | Phase 4 Days 11-15 — 9 `material.*` tools (reads + MIC writes + create + diagnostic + boundary) |
 
 Run a specific phase:
 ```

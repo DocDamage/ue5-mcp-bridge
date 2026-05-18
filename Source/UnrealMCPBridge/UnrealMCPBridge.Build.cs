@@ -62,6 +62,13 @@ public class UnrealMCPBridge : ModuleRules
 				                            // (bp.compile / bp.compile_all_dirty).
 				"BlueprintGraph",           // UK2Node_FunctionEntry, UK2Node_FunctionResult, UEdGraphSchema_K2
 				                            // PC_* constants (variable/function pin type IO).
+				// Phase 4 Days 11-15 — Material surface adds UMaterialEditingLibrary +
+				// UMaterialInstanceConstantFactoryNew (latter lives in UnrealEd/Factories — UnrealEd
+				// already listed). MaterialEditor is required for UMaterialEditingLibrary's static
+				// methods (GetScalar/Vector/Texture/StaticSwitch parameter names + Set*).
+				"MaterialEditor",           // UMaterialEditingLibrary (material.* parameter IO).
+				"RHI",                      // GMaxRHIShaderPlatform (material.get_compile_errors).
+				                            // (GShaderCompilingManager is ENGINE_API — already linked.)
 			}
 		);
 	}

@@ -4,9 +4,7 @@
 Sub-suites (each is a self-contained Python script with its own main()):
   - smoke_phase4_days_1_5.py    — 6 bp.* read tools (Day 1-5)
   - smoke_phase4_days_6_10.py   — 6 bp.* writes + bp.compile + bp.compile_all_dirty (Day 6-10)
-
-Days 11-15 will add a smoke_phase4_days_11_15.py for the material.* surface and the wrapper
-will pick it up automatically (just append to SUB_SUITES below).
+  - smoke_phase4_days_11_15.py  — 9 material.* tools (Day 11-15) — reads + MIC writes + create + diagnostic
 
 Each child inherits the connection args (--host / --port) passed to this wrapper. The wrapper
 exits with the first failing sub-suite's non-zero code, or 0 if all PASS. A short summary line
@@ -26,6 +24,7 @@ HERE = Path(__file__).parent
 SUB_SUITES = [
     "smoke_phase4_days_1_5.py",
     "smoke_phase4_days_6_10.py",
+    "smoke_phase4_days_11_15.py",
 ]
 
 
