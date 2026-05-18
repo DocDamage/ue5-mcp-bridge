@@ -14,6 +14,7 @@
 #include "Tools/AssetCompositeTools.h"
 #include "Tools/AssetRegistryTools.h"
 #include "Tools/ContentBrowserTools.h"
+#include "Tools/LevelTools.h"
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -197,10 +198,16 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	FContentBrowserTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 	FAssetCompositeTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
+	// Phase 3 Day 1: Level operations surface scaffold (2 read tools + 1 Lane B sanity probe).
+	// Days 2-3 will append 10 more level.* mutator/query tools to the same Register() call.
+	// MUST be after Phase 2 registers so the registration log line below counts everything that
+	// landed in the dispatch table this StartupModule pass.
+	FLevelTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
 	UE_LOG(LogMCP, Log,
 		TEXT("Registered dispatch handlers: kind=ExecPython → FMCPPythonEval::EvalExpression, ")
 		TEXT("unknown-method-fallback → FMCPPythonEval::CallPythonTool, ")
-		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12) + asset._internal (3)"));
+		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12) + asset._internal (5) + level.* (2) + _phase3_lane_b_sanity (1)"));
 }
 
 void FUnrealMCPBridgeModule::UnregisterDefaultDispatchHandlers()

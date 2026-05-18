@@ -51,6 +51,9 @@ public class UnrealMCPBridge : ModuleRules
 				"EditorScriptingUtilities", // UEditorAssetSubsystem (LoadAsset, DoesAssetExist, DeleteAsset, SaveAsset, etc.)
 				"ImageCore",                // FImageView (constructs from FColor* for thumbnail encoding)
 				"ImageWrapper",             // FImageUtils::CompressImageArray for thumbnail PNG encoding
+				// Phase 3 — Level + Actor + Component surface.
+				"LevelEditor",              // ULevelEditorSubsystem (NewLevel/LoadLevel/SaveCurrentLevel/etc.),
+				                            // FEditorFileUtils streaming-level helpers used by level.* tools.
 			}
 		);
 	}

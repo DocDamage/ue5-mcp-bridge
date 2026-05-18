@@ -74,6 +74,43 @@ inline constexpr int32 kMCPErrorInputTooLarge            = -32017;
 inline constexpr int32 kMCPErrorThumbnailRenderFailed    = -32018;
 
 /**
+ * Phase 3 — Level + Actor + Component surface. 5 of 11 codes wired in Days 1-3 (remaining 6 land
+ * Days 4+ when their consuming tools ship).
+ *
+ *   -32019 LevelNotFound                Map asset path resolves to no UWorld (level.load /
+ *                                       level.save / level.unload / level.set_streaming_state).
+ *   -32020 ClassNotFound                Reserved for Phase 3 Day 4+ actor.spawn — class path doesn't
+ *                                       resolve to a UClass after best-effort autoload. Declared now
+ *                                       since the cost is one constexpr line and the symbol is
+ *                                       referenced by smoke tests that probe error-code symmetry.
+ *   -32027 PIEActive                    Editor-world mutator refused because GEditor->PlayWorld is
+ *                                       non-null. Message is frozen verbatim (see D10 in the plan):
+ *                                       "editor-world mutators are unavailable during PIE; Phase 5
+ *                                       will add pie.* tools for PIE world; otherwise stop PIE first
+ *                                       if you meant the editor world."
+ *   -32028 LevelNotStreamingEntry       level.set_streaming_state target is loaded but is NOT in
+ *                                       World->GetStreamingLevels() (e.g. the persistent level
+ *                                       itself, or a level loaded by some other code path).
+ *   -32029 WorldPartitionNotSupported   Phase 3 hard-rejects World Partition maps — they have a
+ *                                       fundamentally different streaming model (cells, not
+ *                                       ULevelStreamingDynamic) and Phase 5 will ship a dedicated
+ *                                       wp.* surface for them. Detected via UWorld::IsPartitionedWorld().
+ */
+inline constexpr int32 kMCPErrorLevelNotFound               = -32019;
+inline constexpr int32 kMCPErrorClassNotFound               = -32020;
+inline constexpr int32 kMCPErrorPIEActive                   = -32027;
+inline constexpr int32 kMCPErrorLevelNotStreamingEntry      = -32028;
+inline constexpr int32 kMCPErrorWorldPartitionNotSupported  = -32029;
+
+/**
+ * Frozen wire message returned by every Phase 3+ editor-world mutator when PIE is active.
+ * **Do NOT edit this string** — smoke tests assert both substrings ``"Phase 5"`` AND ``"pie."``.
+ */
+inline const TCHAR* const kMCPMessagePIEActive = TEXT(
+	"editor-world mutators are unavailable during PIE; Phase 5 will add pie.* tools for PIE world; "
+	"otherwise stop PIE first if you meant the editor world.");
+
+/**
  * Distinguishes the high-level kind of a wire request.
  *
  * Phase 1 baseline — values map 1:1 to the protocol verbs described in the
