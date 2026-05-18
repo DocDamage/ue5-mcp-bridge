@@ -4,8 +4,11 @@
 
 #include "FMCPDispatchQueue.h"
 #include "UnrealMCPBridge.h"
+#include "Utils/MCPARFilterParser.h"
 #include "Utils/MCPAssetPathUtils.h"
+#include "Utils/MCPPageCursor.h"
 
+#include "AssetRegistry/ARFilter.h"
 #include "AssetRegistry/AssetData.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
@@ -15,6 +18,7 @@
 #include "Misc/PackageName.h"
 #include "UObject/Package.h"
 #include "UObject/SoftObjectPath.h"
+#include "UObject/TopLevelAssetPath.h"
 
 namespace
 {
@@ -100,6 +104,180 @@ namespace
 		}
 		const int64 Size = IFileManager::Get().FileSize(*PackageFilename);
 		return Size > 0 ? Size : 0;
+	}
+
+	/** Build a JSON object describing one asset for asset.list / asset.search_by_* responses. */
+	TSharedPtr<FJsonObject> AR_BuildAssetSummary(const FAssetData& Data, bool bIncludeTags)
+	{
+		TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+		Obj->SetStringField(TEXT("asset_path"),   Data.GetObjectPathString());
+		Obj->SetStringField(TEXT("package_path"), Data.PackagePath.ToString());
+		Obj->SetStringField(TEXT("class"),        Data.AssetClassPath.ToString());
+		if (bIncludeTags)
+		{
+			AR_AppendTags(Data, Obj);
+		}
+		return Obj;
+	}
+
+	/**
+	 * D11 overly-broad guard: ``package_paths == ["/Game"] && recursive_paths == true && no
+	 * class filter && _unsafe_full_scan == false`` is rejected. Callers can either narrow
+	 * (add ClassPaths or a deeper PackagePaths) or opt in via the ``_unsafe_full_scan`` arg.
+	 */
+	bool AR_IsOverlyBroad(const FARFilter& Filter)
+	{
+		if (Filter.ClassPaths.Num() > 0) { return false; }
+		if (!Filter.bRecursivePaths)     { return false; }
+		if (Filter.PackagePaths.Num() != 1) { return false; }
+		return Filter.PackagePaths[0] == FName(TEXT("/Game"));
+	}
+
+	/**
+	 * Lexicographically sort an FAssetData array by ObjectPath (the pagination sort key per D2).
+	 * Stable sort so equal keys preserve relative order.
+	 */
+	void AR_SortByObjectPath(TArray<FAssetData>& Data)
+	{
+		Data.StableSort([](const FAssetData& A, const FAssetData& B)
+		{
+			return A.GetObjectPathString().Compare(B.GetObjectPathString(), ESearchCase::IgnoreCase) < 0;
+		});
+	}
+
+	/**
+	 * Slice a sorted FAssetData array by ``last_asset_path`` sentinel + ``page_size``. ``OutAssets``
+	 * receives the new page; ``OutNextSentinel`` receives the last entry's ObjectPath (empty if
+	 * the page is the last one — caller emits next_page_token=null).
+	 *
+	 * Skip-until-past-sentinel is O(N) per call, which matches the AR query cost anyway. For very
+	 * large result sets (N > 100k) consider a binary search — out of scope for Phase 2.
+	 */
+	void AR_SlicePage(
+		const TArray<FAssetData>& SortedAll,
+		const FString& LastAssetPath,
+		int32 PageSize,
+		TArray<FAssetData>& OutPageAssets,
+		FString& OutNextSentinel)
+	{
+		OutPageAssets.Reset();
+		OutNextSentinel.Reset();
+
+		// Find first index strictly > LastAssetPath.
+		int32 StartIdx = 0;
+		if (!LastAssetPath.IsEmpty())
+		{
+			while (StartIdx < SortedAll.Num())
+			{
+				const FString Cur = SortedAll[StartIdx].GetObjectPathString();
+				if (Cur.Compare(LastAssetPath, ESearchCase::IgnoreCase) > 0)
+				{
+					break;
+				}
+				++StartIdx;
+			}
+		}
+
+		const int32 EndIdxExcl = FMath::Min(SortedAll.Num(), StartIdx + PageSize);
+		OutPageAssets.Reserve(EndIdxExcl - StartIdx);
+		for (int32 i = StartIdx; i < EndIdxExcl; ++i)
+		{
+			OutPageAssets.Add(SortedAll[i]);
+		}
+
+		// More pages remaining? Only emit sentinel if there's at least one entry past the slice.
+		if (EndIdxExcl < SortedAll.Num() && OutPageAssets.Num() > 0)
+		{
+			OutNextSentinel = OutPageAssets.Last().GetObjectPathString();
+		}
+	}
+
+	/**
+	 * Common return path for asset.list / asset.search_by_* (the four paginated tools). Wraps the
+	 * sliced array + cursor into a uniform JSON response envelope.
+	 *
+	 * ``ItemsFieldName`` is the response array name — "assets" for asset.list, "matches" for the
+	 * three search tools.
+	 */
+	FMCPResponse AR_BuildPaginatedResponse(
+		const FMCPRequest& Request,
+		const TCHAR* ItemsFieldName,
+		const TArray<FAssetData>& PageAssets,
+		int32 TotalKnown,
+		const FString& NextSentinel,
+		uint64 FilterHash,
+		bool bIncludeTags,
+		bool bIncludeColdCacheFlag)
+	{
+		TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+		TArray<TSharedPtr<FJsonValue>> Items;
+		Items.Reserve(PageAssets.Num());
+		for (const FAssetData& Data : PageAssets)
+		{
+			Items.Add(MakeShared<FJsonValueObject>(AR_BuildAssetSummary(Data, bIncludeTags)));
+		}
+		Out->SetArrayField(ItemsFieldName, Items);
+		Out->SetNumberField(TEXT("total_known"), static_cast<double>(TotalKnown));
+
+		if (NextSentinel.IsEmpty())
+		{
+			Out->SetField(TEXT("next_page_token"), MakeShared<FJsonValueNull>());
+		}
+		else
+		{
+			FMCPPageCursor Cursor;
+			Cursor.FilterHash = FilterHash;
+			Cursor.LastAssetPath = NextSentinel;
+			Cursor.TotalKnownSnapshot = TotalKnown;
+			Out->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(Cursor));
+		}
+
+		if (bIncludeColdCacheFlag)
+		{
+			Out->SetBoolField(TEXT("is_cold_cache"),
+				FAssetRegistryModule::GetRegistry().IsLoadingAssets());
+		}
+		return AR_MakeSuccessObj(Request, Out);
+	}
+
+	/**
+	 * Decode + validate a page_token wire value against ``ExpectedFilterHash``. Populates
+	 * ``OutCursor`` on success; populates ``OutError`` and returns false on decode or hash
+	 * mismatch (caller surfaces the response).
+	 */
+	bool AR_DecodeCursor(
+		const FMCPRequest& Request,
+		const FString& PageTokenWire,
+		uint64 ExpectedFilterHash,
+		FMCPPageCursor& OutCursor,
+		FMCPResponse& OutError)
+	{
+		FString DecodeErr;
+		if (!FMCPPageCursorUtils::Decode(PageTokenWire, OutCursor, DecodeErr))
+		{
+			OutError = AR_MakeError(Request, kMCPErrorStaleCursor,
+				FString::Printf(TEXT("page_token decode failed: %s"), *DecodeErr));
+			return false;
+		}
+		if (!FMCPPageCursorUtils::ValidateAgainstFilter(OutCursor, ExpectedFilterHash))
+		{
+			OutError = AR_MakeError(Request, kMCPErrorStaleCursor,
+				TEXT("page_token filter_hash mismatch — caller mutated filter between pages; "
+					 "restart pagination with page_token=null"));
+			return false;
+		}
+		return true;
+	}
+
+	/** Validate page_size; clamps to [1, 1000] per the inline schema. */
+	int32 AR_ClampPageSize(const TSharedPtr<FJsonObject>& Args, const TCHAR* FieldName, int32 Default)
+	{
+		int32 Out = Default;
+		if (Args.IsValid())
+		{
+			Args->TryGetNumberField(FieldName, Out);
+		}
+		return FMath::Clamp(Out, 1, 1000);
 	}
 }
 
@@ -224,10 +402,62 @@ FMCPResponse Tool_AssetIsDirty(const FMCPRequest& Request)
 	return AR_MakeSuccessObj(Request, Out);
 }
 
-// ─── Day 3+ tools: stubs to be implemented in subsequent commits ─────────────────────────────
+// ─── asset.list (paginated, FARFilter) ───────────────────────────────────────────────────────
 FMCPResponse Tool_AssetList(const FMCPRequest& Request)
 {
-	return AR_MakeError(Request, -32601, TEXT("asset.list — Day 3 stub (not yet implemented)"));
+	if (!Request.Args.IsValid())
+	{
+		return AR_MakeError(Request, kARErrorInvalidParams, TEXT("missing args object"));
+	}
+
+	// Parse FARFilter from args.filter (object). Missing/empty → default FARFilter (matches all).
+	const TSharedPtr<FJsonObject>* FilterObjPtr = nullptr;
+	Request.Args->TryGetObjectField(TEXT("filter"), FilterObjPtr);
+	TSharedPtr<FJsonObject> FilterObj = (FilterObjPtr && FilterObjPtr->IsValid()) ? *FilterObjPtr : TSharedPtr<FJsonObject>();
+
+	FARFilter Filter;
+	FString ParseErr;
+	if (!FMCPARFilterParser::Parse(FilterObj, Filter, ParseErr))
+	{
+		return AR_MakeError(Request, kARErrorInvalidParams,
+			FString::Printf(TEXT("filter parse error: %s"), *ParseErr));
+	}
+
+	// Overly-broad guard (D11) — opt-out via args._unsafe_full_scan.
+	bool bUnsafeFullScan = false;
+	Request.Args->TryGetBoolField(TEXT("_unsafe_full_scan"), bUnsafeFullScan);
+	if (!bUnsafeFullScan && AR_IsOverlyBroad(Filter))
+	{
+		return AR_MakeError(Request, kMCPErrorOverlyBroadQuery,
+			TEXT("filter targets entire /Game recursively with no class narrowing. "
+				 "Add class_paths or set _unsafe_full_scan=true"));
+	}
+
+	const int32 PageSize = AR_ClampPageSize(Request.Args, TEXT("page_size"), 100);
+
+	// page_token (optional). filter_hash validation = STALE_CURSOR if mismatched.
+	const uint64 FilterHash = FMCPARFilterParser::ComputeFilterHash(Filter);
+	FString PageTokenWire;
+	Request.Args->TryGetStringField(TEXT("page_token"), PageTokenWire);
+	FMCPPageCursor Cursor;
+	FMCPResponse CursorErr;
+	if (!AR_DecodeCursor(Request, PageTokenWire, FilterHash, Cursor, CursorErr))
+	{
+		return CursorErr;
+	}
+
+	// Full re-query + sort + slice. AR query is documented thread-safe.
+	IAssetRegistry& IAR = FAssetRegistryModule::GetRegistry();
+	TArray<FAssetData> All;
+	IAR.GetAssets(Filter, All);
+	AR_SortByObjectPath(All);
+
+	TArray<FAssetData> Page;
+	FString NextSentinel;
+	AR_SlicePage(All, Cursor.LastAssetPath, PageSize, Page, NextSentinel);
+
+	return AR_BuildPaginatedResponse(Request, TEXT("assets"), Page, All.Num(), NextSentinel,
+		FilterHash, /*bIncludeTags*/ true, /*bIncludeColdCacheFlag*/ true);
 }
 FMCPResponse Tool_AssetFindReferences(const FMCPRequest& Request)
 {
@@ -237,17 +467,332 @@ FMCPResponse Tool_AssetFindDependents(const FMCPRequest& Request)
 {
 	return AR_MakeError(Request, -32601, TEXT("asset.find_dependents — Day 4 stub"));
 }
+// ─── asset.search_by_class ───────────────────────────────────────────────────────────────────
 FMCPResponse Tool_AssetSearchByClass(const FMCPRequest& Request)
 {
-	return AR_MakeError(Request, -32601, TEXT("asset.search_by_class — Day 3 stub"));
+	if (!Request.Args.IsValid())
+	{
+		return AR_MakeError(Request, kARErrorInvalidParams, TEXT("missing args object"));
+	}
+
+	FString ClassPath;
+	if (!Request.Args->TryGetStringField(TEXT("class_path"), ClassPath) || ClassPath.IsEmpty())
+	{
+		return AR_MakeError(Request, kARErrorInvalidParams,
+			TEXT("missing required string field 'class_path'"));
+	}
+
+	// Allow either /Script/Engine.StaticMesh or /Script/Engine/StaticMesh form (FTopLevelAssetPath
+	// requires the dot).
+	FString ClassPathNormalized = ClassPath;
+	if (!ClassPathNormalized.Contains(TEXT(".")))
+	{
+		int32 LastSlash = INDEX_NONE;
+		if (ClassPathNormalized.FindLastChar(TEXT('/'), LastSlash))
+		{
+			ClassPathNormalized[LastSlash] = TEXT('.');
+		}
+	}
+	FTopLevelAssetPath Top;
+	if (!Top.TrySetPath(ClassPathNormalized))
+	{
+		return AR_MakeError(Request, kMCPErrorWrongClass,
+			FString::Printf(TEXT("class_path '%s' does not resolve to FTopLevelAssetPath"), *ClassPath));
+	}
+
+	// Build the equivalent FARFilter then delegate to the same pagination path as asset.list.
+	FARFilter Filter;
+	Filter.ClassPaths.Add(Top);
+
+	const TArray<TSharedPtr<FJsonValue>>* PackagePathsPtr = nullptr;
+	if (Request.Args->TryGetArrayField(TEXT("package_paths"), PackagePathsPtr))
+	{
+		for (const TSharedPtr<FJsonValue>& V : *PackagePathsPtr)
+		{
+			FString S;
+			if (!V.IsValid() || !V->TryGetString(S))
+			{
+				return AR_MakeError(Request, kARErrorInvalidParams,
+					TEXT("package_paths: expected array of strings"));
+			}
+			const FString Norm = FMCPAssetPathUtils::Normalize(S);
+			if (Norm.IsEmpty())
+			{
+				return AR_MakeError(Request, kMCPErrorInvalidPath,
+					FString::Printf(TEXT("package_paths entry '%s' is malformed"), *S));
+			}
+			Filter.PackagePaths.Add(FName(*Norm));
+		}
+	}
+	else
+	{
+		// Default to /Game per the inline schema.
+		Filter.PackagePaths.Add(FName(TEXT("/Game")));
+	}
+
+	bool bRecursivePaths = true;  // default per schema
+	Request.Args->TryGetBoolField(TEXT("recursive_paths"), bRecursivePaths);
+	Filter.bRecursivePaths = bRecursivePaths;
+
+	bool bSearchSubclasses = false;
+	Request.Args->TryGetBoolField(TEXT("search_subclasses"), bSearchSubclasses);
+	Filter.bRecursiveClasses = bSearchSubclasses;
+
+	// Same overly-broad guard so "search_by_class with bare /Game + recursive + no narrowing"
+	// still trips — except in this tool we ALWAYS have a class filter so the guard never fires.
+	// Kept here defensively in case the schema changes.
+	bool bUnsafeFullScan = false;
+	Request.Args->TryGetBoolField(TEXT("_unsafe_full_scan"), bUnsafeFullScan);
+	if (!bUnsafeFullScan && AR_IsOverlyBroad(Filter))
+	{
+		return AR_MakeError(Request, kMCPErrorOverlyBroadQuery,
+			TEXT("search_by_class scope too broad — narrow package_paths"));
+	}
+
+	const int32 PageSize = AR_ClampPageSize(Request.Args, TEXT("page_size"), 100);
+	const uint64 FilterHash = FMCPARFilterParser::ComputeFilterHash(Filter);
+	FString PageTokenWire;
+	Request.Args->TryGetStringField(TEXT("page_token"), PageTokenWire);
+	FMCPPageCursor Cursor;
+	FMCPResponse CursorErr;
+	if (!AR_DecodeCursor(Request, PageTokenWire, FilterHash, Cursor, CursorErr))
+	{
+		return CursorErr;
+	}
+
+	IAssetRegistry& IAR = FAssetRegistryModule::GetRegistry();
+	TArray<FAssetData> All;
+	IAR.GetAssets(Filter, All);
+	AR_SortByObjectPath(All);
+
+	TArray<FAssetData> Page;
+	FString NextSentinel;
+	AR_SlicePage(All, Cursor.LastAssetPath, PageSize, Page, NextSentinel);
+
+	return AR_BuildPaginatedResponse(Request, TEXT("matches"), Page, All.Num(), NextSentinel,
+		FilterHash, /*bIncludeTags*/ false, /*bIncludeColdCacheFlag*/ true);
 }
+
+// ─── asset.search_by_tag ─────────────────────────────────────────────────────────────────────
 FMCPResponse Tool_AssetSearchByTag(const FMCPRequest& Request)
 {
-	return AR_MakeError(Request, -32601, TEXT("asset.search_by_tag — Day 3 stub"));
+	if (!Request.Args.IsValid())
+	{
+		return AR_MakeError(Request, kARErrorInvalidParams, TEXT("missing args object"));
+	}
+
+	FString TagName;
+	if (!Request.Args->TryGetStringField(TEXT("tag_name"), TagName) || TagName.IsEmpty())
+	{
+		return AR_MakeError(Request, kARErrorInvalidParams,
+			TEXT("missing required string field 'tag_name'"));
+	}
+
+	// tag_value: nullable string. Empty / missing / explicit null = any-value match.
+	FString TagValue;
+	const bool bHasValue = Request.Args->TryGetStringField(TEXT("tag_value"), TagValue) && !TagValue.IsEmpty();
+
+	// Optional package_paths post-filter (defaults to ["/Game"]).
+	TArray<FString> ScopePaths;
+	const TArray<TSharedPtr<FJsonValue>>* ScopePtr = nullptr;
+	if (Request.Args->TryGetArrayField(TEXT("package_paths"), ScopePtr))
+	{
+		for (const TSharedPtr<FJsonValue>& V : *ScopePtr)
+		{
+			FString S;
+			if (!V.IsValid() || !V->TryGetString(S))
+			{
+				return AR_MakeError(Request, kARErrorInvalidParams,
+					TEXT("package_paths: expected array of strings"));
+			}
+			const FString Norm = FMCPAssetPathUtils::Normalize(S);
+			if (Norm.IsEmpty())
+			{
+				return AR_MakeError(Request, kMCPErrorInvalidPath,
+					FString::Printf(TEXT("package_paths entry '%s' is malformed"), *S));
+			}
+			ScopePaths.Add(Norm);
+		}
+	}
+	else
+	{
+		ScopePaths.Add(TEXT("/Game"));
+	}
+
+	const int32 PageSize = AR_ClampPageSize(Request.Args, TEXT("page_size"), 100);
+
+	IAssetRegistry& IAR = FAssetRegistryModule::GetRegistry();
+	TArray<FAssetData> Raw;
+	if (bHasValue)
+	{
+		TMultiMap<FName, FString> Map;
+		Map.Add(FName(*TagName), TagValue);
+		IAR.GetAssetsByTagValues(Map, Raw);
+	}
+	else
+	{
+		TArray<FName> Tags;
+		Tags.Add(FName(*TagName));
+		IAR.GetAssetsByTags(Tags, Raw);
+	}
+
+	// Post-filter by package_paths prefix (case-insensitive). GetAssetsByTags doesn't accept a path
+	// scope; we do it in user space.
+	TArray<FAssetData> Filtered;
+	Filtered.Reserve(Raw.Num());
+	for (const FAssetData& Data : Raw)
+	{
+		const FString PkgPath = Data.PackagePath.ToString();
+		for (const FString& Scope : ScopePaths)
+		{
+			if (PkgPath.StartsWith(Scope, ESearchCase::IgnoreCase))
+			{
+				Filtered.Add(Data);
+				break;
+			}
+		}
+	}
+	AR_SortByObjectPath(Filtered);
+
+	// Build a stable filter-hash for pagination — synthesise an FARFilter with the same
+	// human-meaningful fields so the canonical-form hash distinguishes different invocations.
+	FARFilter HashFilter;
+	for (const FString& Scope : ScopePaths) { HashFilter.PackagePaths.Add(FName(*Scope)); }
+	TOptional<FString> ValOpt;
+	if (bHasValue) { ValOpt = TagValue; }
+	HashFilter.TagsAndValues.Add(FName(*TagName), ValOpt);
+	const uint64 FilterHash = FMCPARFilterParser::ComputeFilterHash(HashFilter);
+
+	FString PageTokenWire;
+	Request.Args->TryGetStringField(TEXT("page_token"), PageTokenWire);
+	FMCPPageCursor Cursor;
+	FMCPResponse CursorErr;
+	if (!AR_DecodeCursor(Request, PageTokenWire, FilterHash, Cursor, CursorErr))
+	{
+		return CursorErr;
+	}
+
+	TArray<FAssetData> Page;
+	FString NextSentinel;
+	AR_SlicePage(Filtered, Cursor.LastAssetPath, PageSize, Page, NextSentinel);
+
+	// Custom response shape — includes per-item ``tag_value`` field, so we can't reuse the
+	// generic paginated builder verbatim.
+	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> Items;
+	Items.Reserve(Page.Num());
+	for (const FAssetData& Data : Page)
+	{
+		TSharedPtr<FJsonObject> ItemObj = AR_BuildAssetSummary(Data, /*bIncludeTags*/ false);
+		const FAssetTagValueRef ValRef = Data.TagsAndValues.FindTag(FName(*TagName));
+		ItemObj->SetStringField(TEXT("tag_value"), ValRef.IsSet() ? ValRef.AsString() : FString());
+		Items.Add(MakeShared<FJsonValueObject>(ItemObj));
+	}
+	Out->SetArrayField(TEXT("matches"), Items);
+	Out->SetNumberField(TEXT("total_known"), static_cast<double>(Filtered.Num()));
+	if (NextSentinel.IsEmpty())
+	{
+		Out->SetField(TEXT("next_page_token"), MakeShared<FJsonValueNull>());
+	}
+	else
+	{
+		FMCPPageCursor NewCursor;
+		NewCursor.FilterHash = FilterHash;
+		NewCursor.LastAssetPath = NextSentinel;
+		NewCursor.TotalKnownSnapshot = Filtered.Num();
+		Out->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(NewCursor));
+	}
+	return AR_MakeSuccessObj(Request, Out);
 }
+
+// ─── asset.search_by_name ────────────────────────────────────────────────────────────────────
 FMCPResponse Tool_AssetSearchByName(const FMCPRequest& Request)
 {
-	return AR_MakeError(Request, -32601, TEXT("asset.search_by_name — Day 3 stub"));
+	if (!Request.Args.IsValid())
+	{
+		return AR_MakeError(Request, kARErrorInvalidParams, TEXT("missing args object"));
+	}
+
+	FString Pattern;
+	if (!Request.Args->TryGetStringField(TEXT("name_pattern"), Pattern) || Pattern.IsEmpty())
+	{
+		return AR_MakeError(Request, kARErrorInvalidParams,
+			TEXT("missing required string field 'name_pattern'"));
+	}
+	bool bCaseSensitive = false;
+	Request.Args->TryGetBoolField(TEXT("case_sensitive"), bCaseSensitive);
+
+	// package_paths scope (default ["/Game"], recursive). We let the AR filter handle the
+	// folder scope so the candidate-set is bounded.
+	FARFilter Filter;
+	Filter.bRecursivePaths = true;
+	const TArray<TSharedPtr<FJsonValue>>* ScopePtr = nullptr;
+	if (Request.Args->TryGetArrayField(TEXT("package_paths"), ScopePtr))
+	{
+		for (const TSharedPtr<FJsonValue>& V : *ScopePtr)
+		{
+			FString S;
+			if (!V.IsValid() || !V->TryGetString(S))
+			{
+				return AR_MakeError(Request, kARErrorInvalidParams,
+					TEXT("package_paths: expected array of strings"));
+			}
+			const FString Norm = FMCPAssetPathUtils::Normalize(S);
+			if (Norm.IsEmpty())
+			{
+				return AR_MakeError(Request, kMCPErrorInvalidPath,
+					FString::Printf(TEXT("package_paths entry '%s' is malformed"), *S));
+			}
+			Filter.PackagePaths.Add(FName(*Norm));
+		}
+	}
+	else
+	{
+		Filter.PackagePaths.Add(FName(TEXT("/Game")));
+	}
+
+	const int32 PageSize = AR_ClampPageSize(Request.Args, TEXT("page_size"), 100);
+
+	IAssetRegistry& IAR = FAssetRegistryModule::GetRegistry();
+	TArray<FAssetData> Raw;
+	IAR.GetAssets(Filter, Raw);
+
+	const ESearchCase::Type SearchMode = bCaseSensitive ? ESearchCase::CaseSensitive : ESearchCase::IgnoreCase;
+	TArray<FAssetData> Matches;
+	Matches.Reserve(Raw.Num());
+	for (const FAssetData& Data : Raw)
+	{
+		if (Data.AssetName.ToString().Contains(Pattern, SearchMode))
+		{
+			Matches.Add(Data);
+		}
+	}
+	AR_SortByObjectPath(Matches);
+
+	// Filter-hash mixes Pattern + case flag + scope. We encode Pattern into a synthesised tag
+	// entry so the canonical-form hash distinguishes "search Cat case-sensitive" from "search
+	// Cat case-insensitive".
+	FARFilter HashFilter = Filter;
+	HashFilter.TagsAndValues.Add(FName(TEXT("__name_pattern__")), TOptional<FString>(Pattern));
+	HashFilter.TagsAndValues.Add(FName(TEXT("__case_sensitive__")),
+		TOptional<FString>(bCaseSensitive ? TEXT("1") : TEXT("0")));
+	const uint64 FilterHash = FMCPARFilterParser::ComputeFilterHash(HashFilter);
+
+	FString PageTokenWire;
+	Request.Args->TryGetStringField(TEXT("page_token"), PageTokenWire);
+	FMCPPageCursor Cursor;
+	FMCPResponse CursorErr;
+	if (!AR_DecodeCursor(Request, PageTokenWire, FilterHash, Cursor, CursorErr))
+	{
+		return CursorErr;
+	}
+
+	TArray<FAssetData> Page;
+	FString NextSentinel;
+	AR_SlicePage(Matches, Cursor.LastAssetPath, PageSize, Page, NextSentinel);
+
+	return AR_BuildPaginatedResponse(Request, TEXT("matches"), Page, Matches.Num(), NextSentinel,
+		FilterHash, /*bIncludeTags*/ false, /*bIncludeColdCacheFlag*/ false);
 }
 FMCPResponse Tool_AssetGetThumbnail(const FMCPRequest& Request)
 {
