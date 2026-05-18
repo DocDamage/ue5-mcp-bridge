@@ -7,6 +7,16 @@
 #include "Dom/JsonValue.h"
 #include "Misc/Guid.h"
 
+/** Default TCP port for the MCP bridge listener (loopback only). */
+inline constexpr int32 kMCPDefaultPort = 30020;
+
+/**
+ * Per-line frame cap (bytes). Raised from v1's 8 MiB to 64 MiB per blueprint v2 §C6 — large
+ * screenshot/thumbnail payloads exceed the older limit even after base64 wrapping. Any single
+ * inbound line larger than this aborts the connection (DoS guard).
+ */
+inline constexpr int32 kMCPFrameMaxBytes = 64 * 1024 * 1024;
+
 /**
  * Distinguishes the high-level kind of a wire request.
  *
@@ -56,6 +66,14 @@ struct FMCPRequest
 
 	/** Wall-clock seconds when the listener accepted this request (for timeouts/metrics). */
 	double ReceivedAtSeconds = 0.0;
+
+	/**
+	 * Verbatim "id" string from the wire frame. Preserved so we can echo back exactly what the
+	 * client sent — even if it wasn't GUID-shaped (e.g. "test-1"). RequestId above is synthesised
+	 * from this when it's not parseable as a GUID; OriginalIdString is the source of truth for
+	 * round-trip correlation.
+	 */
+	FString OriginalIdString;
 };
 
 /**
@@ -69,6 +87,13 @@ struct FMCPResponse
 {
 	/** Echo of FMCPRequest::RequestId for correlation. */
 	FGuid RequestId;
+
+	/**
+	 * Verbatim "id" string copied from FMCPRequest::OriginalIdString. Serialised as the response "id"
+	 * field on the wire so opaque (non-GUID) client ids round-trip exactly. Empty falls back to
+	 * RequestId.ToString(EGuidFormats::DigitsWithHyphens).
+	 */
+	FString OriginalIdString;
 
 	/** True iff this is a structured error rather than a successful result. */
 	bool bIsError = false;
