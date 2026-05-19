@@ -15,6 +15,7 @@
 #include "Tools/AssetCompositeTools.h"
 #include "Tools/AssetRegistryTools.h"
 #include "Tools/BlueprintCompositeTools.h"
+#include "Tools/BlueprintGraphTools.h"
 #include "Tools/BlueprintTools.h"
 #include "Tools/ComponentTools.h"
 #include "Tools/ConfigTools.h"
@@ -262,6 +263,15 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 
 	// Wave A 2026-05: stats surface (engine + memory snapshots, Lane A, editor-context safe).
 	FStatsTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Wave B Tier 4 2026-05: Blueprint graph-node construction surface (2 tools, Lane A).
+	//   bp.add_node      — instantiate K2Node subclass on a UEdGraph, configure variable/function
+	//                      reference, AddNode + AllocateDefaultPins + ReconstructNode.
+	//   bp.connect_pins  — UEdGraphSchema_K2::CanCreateConnection (pre-check) + TryCreateConnection,
+	//                      reports broke_existing_count.
+	// Both PIE-guarded. New error codes -32050 GraphNotFound, -32051 NodeNotFound, -32052
+	// PinNotFound, -32053 PinConnectionRefused (see MCPTypes.h).
+	FBlueprintGraphTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	// Phase 5 Chunk A: PIE surface (10 tools, all Lane A). Inverse PIE-guard: every pie.* tool
 	// except pie.start and pie.is_running requires PIE to BE running; refuses with -32038

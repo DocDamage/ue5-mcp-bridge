@@ -305,6 +305,31 @@ inline constexpr int32 kMCPErrorLiveCodingDisabled               = -32048;
 inline constexpr int32 kMCPErrorLogCategoryUnknown               = -32049;
 
 /**
+ * Wave B Tier 4 — Blueprint graph-node construction (bp.add_node / bp.connect_pins).
+ *
+ *   -32050 GraphNotFound           ``graph_name`` not in Blueprint->{UbergraphPages,
+ *                                  FunctionGraphs, MacroGraphs}. Caller's recovery: use
+ *                                  bp.list_functions for function names; the standard event
+ *                                  graph is "EventGraph".
+ *   -32051 NodeNotFound            ``from_node``/``to_node`` Guid not present in the target
+ *                                  graph's Nodes[]. Caller's recovery: bp.list_nodes_in_function
+ *                                  to enumerate Guids; or pass the Guid returned by a prior
+ *                                  bp.add_node response.
+ *   -32052 PinNotFound             ``from_pin``/``to_pin`` name not found on the resolved node.
+ *                                  Caller's recovery: bp.add_node response carries pins[] (or
+ *                                  bp.list_nodes_in_function for existing nodes).
+ *   -32053 PinConnectionRefused    ``UEdGraphSchema_K2::CanCreateConnection`` returned
+ *                                  CONNECT_RESPONSE_DISALLOW. Reason carried in the response
+ *                                  message (incompatible types, both pins same direction,
+ *                                  read-only output, etc.). Caller's recovery: inspect the
+ *                                  message, adjust pin selection.
+ */
+inline constexpr int32 kMCPErrorGraphNotFound                    = -32050;
+inline constexpr int32 kMCPErrorNodeNotFound                     = -32051;
+inline constexpr int32 kMCPErrorPinNotFound                      = -32052;
+inline constexpr int32 kMCPErrorPinConnectionRefused             = -32053;
+
+/**
  * Frozen wire message returned by every Phase 3+ editor-world mutator when PIE is active.
  * **Do NOT edit this string** — smoke tests assert both substrings ``"Phase 5"`` AND ``"pie."``.
  */
