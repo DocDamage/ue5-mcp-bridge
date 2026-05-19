@@ -13,7 +13,14 @@
 #include "AssetRegistry/AssetIdentifier.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
+#include "AssetToolsModule.h"
+#include "Editor.h"
+#include "Engine/DataAsset.h"
+#include "Factories/DataAssetFactory.h"
+#include "IAssetTools.h"
 #include "ImageUtils.h"
+#include "Subsystems/EditorAssetSubsystem.h"
+#include "UObject/UObjectIterator.h"
 #include "Misc/AssetRegistryInterface.h"
 #include "Misc/Base64.h"
 #include "Misc/FileHelper.h"
@@ -1375,6 +1382,303 @@ FMCPResponse Tool_AssetGetClassHierarchy(const FMCPRequest& Request)
 	return AR_MakeSuccessObj(Request, Out);
 }
 
+// ─── asset.create_data_asset — create a new UDataAsset of given class at given path ─────────
+//
+// Args:
+//   - class_path: string (required)   /Script/<Module>.<Class>  OR  /Game/.../BP.BP_C
+//   - dest_path:  string (required)   /Game/.../DA_NewAsset  (extension omitted — added by factory)
+//   - save:       bool   (optional)   default false. true → calls UEditorAssetSubsystem::SaveLoadedAsset
+//                                       on the created asset before returning.
+//
+// Result:
+//   - created:     bool
+//   - asset_path:  string  (e.g. "/Game/MCPTest/DA_NewItem.DA_NewItem")
+//   - class_path:  string  (echo of resolved class)
+//   - saved:       bool    (true if save=true and SaveLoadedAsset succeeded)
+//
+// Error codes (subset; reused from Phase 2/3):
+//   -32010 InvalidPath        dest_path malformed (no /Game/... mount, has '\' or '..')
+//   -32014 PathInUse          dest_path already exists on disk
+//   -32020 ClassNotFound      class_path didn't resolve via LoadObject (with _C autoload fallback)
+//   -32021 ClassAbstract      class is CLASS_Abstract — cannot be instantiated
+//   -32022 WrongClassFamily   class resolves but isn't UDataAsset subclass
+//   -32023 InvalidClassPath   class_path syntactically malformed
+//   -32027 PIEActive          GEditor->PlayWorld != nullptr — refused
+//   -32603 InternalError      IAssetTools::CreateAsset returned null (factory rejected / package conflict)
+//
+// Lane A (game thread only — UDataAssetFactory + IAssetTools require GT). PIE-guarded.
+FMCPResponse Tool_AssetCreateDataAsset(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (GEditor && GEditor->PlayWorld != nullptr)
+	{
+		return AR_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+	}
+
+	if (!Request.Args.IsValid())
+	{
+		return AR_MakeError(Request, -32602,
+			TEXT("asset.create_data_asset requires args.class_path + args.dest_path"));
+	}
+
+	// ─── Parse + validate class_path ───────────────────────────────────────────────────────────
+	FString ClassPath;
+	if (!Request.Args->TryGetStringField(TEXT("class_path"), ClassPath) || ClassPath.IsEmpty())
+	{
+		return AR_MakeError(Request, -32602, TEXT("missing required string field 'class_path'"));
+	}
+	if (!ClassPath.StartsWith(TEXT("/")) || ClassPath.Contains(TEXT("\\")))
+	{
+		return AR_MakeError(Request, kMCPErrorInvalidClassPath,
+			FString::Printf(TEXT("class_path '%s' must start with '/' and use forward slashes only "
+				"(form: /Script/<Module>.<Class>  OR  /Game/.../BP.BP_C)"), *ClassPath));
+	}
+
+	UClass* TargetClass = LoadClass<UObject>(nullptr, *ClassPath);
+	if (!TargetClass)
+	{
+		// Try BP autoload — Blueprint generated classes need _C suffix
+		FString WithC = ClassPath.EndsWith(TEXT("_C")) ? ClassPath : (ClassPath + TEXT("_C"));
+		TargetClass = LoadClass<UObject>(nullptr, *WithC);
+	}
+	if (!TargetClass)
+	{
+		return AR_MakeError(Request, kMCPErrorClassNotFound,
+			FString::Printf(TEXT("could not LoadClass '%s' (also tried _C suffix)"), *ClassPath));
+	}
+	if (TargetClass->HasAnyClassFlags(CLASS_Abstract))
+	{
+		return AR_MakeError(Request, kMCPErrorClassAbstract,
+			FString::Printf(TEXT("class '%s' is abstract — cannot instantiate"),
+				*TargetClass->GetPathName()));
+	}
+	if (!TargetClass->IsChildOf(UDataAsset::StaticClass()))
+	{
+		return AR_MakeError(Request, kMCPErrorWrongClassFamily,
+			FString::Printf(TEXT("class '%s' is not a UDataAsset subclass (parent chain: %s ...)"),
+				*TargetClass->GetPathName(),
+				TargetClass->GetSuperClass() ? *TargetClass->GetSuperClass()->GetPathName() : TEXT("?")));
+	}
+
+	// ─── Parse + validate dest_path ────────────────────────────────────────────────────────────
+	FString DestPathRaw;
+	if (!Request.Args->TryGetStringField(TEXT("dest_path"), DestPathRaw) || DestPathRaw.IsEmpty())
+	{
+		return AR_MakeError(Request, -32602, TEXT("missing required string field 'dest_path'"));
+	}
+	const FString DestPathNorm = FMCPAssetPathUtils::Normalize(DestPathRaw);
+	if (DestPathNorm.IsEmpty())
+	{
+		return AR_MakeError(Request, kMCPErrorInvalidPath,
+			FString::Printf(TEXT("dest_path '%s' is not a valid mount-prefixed asset path "
+				"(expected /Game/... or /<Plugin>/...)"), *DestPathRaw));
+	}
+	if (FPackageName::DoesPackageExist(DestPathNorm))
+	{
+		return AR_MakeError(Request, kMCPErrorPathInUse,
+			FString::Printf(TEXT("dest_path '%s' already exists on disk — use cb.delete first or pick a different name"),
+				*DestPathNorm));
+	}
+
+	// ─── Create via UDataAssetFactory + IAssetTools::CreateAsset ───────────────────────────────
+	const FString PackagePath = FPaths::GetPath(DestPathNorm);
+	const FString AssetName   = FPaths::GetBaseFilename(DestPathNorm);
+
+	UDataAssetFactory* Factory = NewObject<UDataAssetFactory>();
+	Factory->DataAssetClass = TargetClass;
+
+	IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get();
+	UObject* NewAsset = AssetTools.CreateAsset(AssetName, PackagePath, TargetClass, Factory);
+	if (!NewAsset)
+	{
+		return AR_MakeError(Request, -32603,
+			FString::Printf(TEXT("IAssetTools::CreateAsset returned null for class=%s name=%s path=%s "
+				"(factory may have rejected; check editor log)"),
+				*TargetClass->GetPathName(), *AssetName, *PackagePath));
+	}
+
+	// Mark dirty so cb.save / cb.save_all_dirty picks it up.
+	if (UPackage* Pkg = NewAsset->GetOutermost()) { Pkg->MarkPackageDirty(); }
+
+	bool bSaveRequested = false;
+	bool bSavedOk       = false;
+	Request.Args->TryGetBoolField(TEXT("save"), bSaveRequested);
+	if (bSaveRequested)
+	{
+		if (UEditorAssetSubsystem* EAS = GEditor ? GEditor->GetEditorSubsystem<UEditorAssetSubsystem>() : nullptr)
+		{
+			bSavedOk = EAS->SaveLoadedAsset(NewAsset, /*bOnlyIfIsDirty*/ true);
+		}
+	}
+
+	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetBoolField(TEXT("created"), true);
+	Out->SetStringField(TEXT("asset_path"), NewAsset->GetPathName());
+	Out->SetStringField(TEXT("class_path"), TargetClass->GetPathName());
+	Out->SetBoolField(TEXT("saved"), bSavedOk);
+	return AR_MakeSuccessObj(Request, Out);
+}
+
+// ─── asset.list_data_asset_classes — discover UDataAsset subclasses available for create ────
+//
+// Args:
+//   - prefix_filter:    string (optional)  case-insensitive class-name prefix filter
+//   - include_abstract: bool   (optional)  default false — abstract classes can't be created;
+//                                            include them only for discovery/UI purposes
+//   - page_token:       string (optional)  FMCPPageCursor; filter_hash binds prefix_filter +
+//                                            include_abstract together
+//   - page_size:        int    (optional)  default 100, max 1000
+//
+// Result:
+//   - classes[{class_path, class_name, parent_class_path, is_abstract, is_blueprint_generated,
+//              source_module, description}]
+//   - next_page_token (string|null)
+//   - total_known     (int)
+//
+// Only NATIVE UClasses are enumerated (TObjectIterator<UClass>). Blueprint-based DA classes
+// require an AssetRegistry walk + ParentClass-tag lookup — deferred to a future variant
+// (`asset.list_data_asset_blueprints`) to keep this tool fast and predictable.
+//
+// Lane A (TObjectIterator is GT-only).
+FMCPResponse Tool_AssetListDataAssetClasses(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	FString PrefixFilter;
+	bool bIncludeAbstract = false;
+	int32 PageSize = 100;
+	FString PageTokenWire;
+	if (Request.Args.IsValid())
+	{
+		Request.Args->TryGetStringField(TEXT("prefix_filter"), PrefixFilter);
+		Request.Args->TryGetBoolField(TEXT("include_abstract"), bIncludeAbstract);
+		Request.Args->TryGetStringField(TEXT("page_token"), PageTokenWire);
+		int32 RawPageSize = 0;
+		if (Request.Args->TryGetNumberField(TEXT("page_size"), RawPageSize))
+		{
+			PageSize = FMath::Clamp(RawPageSize, 1, 1000);
+		}
+	}
+
+	// Filter hash binds discovery args so mid-pagination changes → -32015 StaleCursor.
+	const uint64 FilterHash = static_cast<uint64>(GetTypeHash(PrefixFilter)) ^
+		(static_cast<uint64>(bIncludeAbstract ? 1 : 0) << 32) ^ 0xDA7AA55E70000001ULL;
+
+	FMCPPageCursor Cursor;
+	if (!PageTokenWire.IsEmpty())
+	{
+		FString DecodeErr;
+		if (!FMCPPageCursorUtils::Decode(PageTokenWire, Cursor, DecodeErr))
+		{
+			return AR_MakeError(Request, -32602,
+				FString::Printf(TEXT("page_token decode failed: %s"), *DecodeErr));
+		}
+		if (Cursor.FilterHash != FilterHash)
+		{
+			return AR_MakeError(Request, kMCPErrorStaleCursor,
+				TEXT("page_token's filter_hash doesn't match current call's filter — "
+					 "caller changed prefix_filter or include_abstract mid-pagination"));
+		}
+	}
+
+	// Walk all native UClasses; filter to UDataAsset subclasses; sort by class path.
+	TArray<UClass*> AllMatching;
+	AllMatching.Reserve(64);
+	const UClass* BaseClass = UDataAsset::StaticClass();
+	for (TObjectIterator<UClass> It; It; ++It)
+	{
+		UClass* C = *It;
+		if (!C || !C->IsChildOf(BaseClass) || C == BaseClass)
+		{
+			continue;
+		}
+		if (!bIncludeAbstract && C->HasAnyClassFlags(CLASS_Abstract))
+		{
+			continue;
+		}
+		// Skip skeleton/REINST classes that aren't "real".
+		if (C->HasAnyClassFlags(CLASS_NewerVersionExists | CLASS_Deprecated | CLASS_Hidden))
+		{
+			continue;
+		}
+		// Apply prefix filter (case-insensitive on class name).
+		if (!PrefixFilter.IsEmpty())
+		{
+			if (!C->GetName().StartsWith(PrefixFilter, ESearchCase::IgnoreCase))
+			{
+				continue;
+			}
+		}
+		AllMatching.Add(C);
+	}
+	AllMatching.StableSort([](const UClass& A, const UClass& B)
+	{
+		return A.GetPathName().Compare(B.GetPathName(), ESearchCase::IgnoreCase) < 0;
+	});
+
+	const int32 TotalKnown = AllMatching.Num();
+
+	// Skip-until-past-sentinel.
+	int32 StartIdx = 0;
+	if (!Cursor.LastAssetPath.IsEmpty())
+	{
+		while (StartIdx < TotalKnown)
+		{
+			if (AllMatching[StartIdx]->GetPathName().Compare(Cursor.LastAssetPath, ESearchCase::IgnoreCase) > 0)
+			{
+				break;
+			}
+			++StartIdx;
+		}
+	}
+	const int32 EndExcl = FMath::Min(TotalKnown, StartIdx + PageSize);
+
+	TArray<TSharedPtr<FJsonValue>> Out;
+	Out.Reserve(EndExcl - StartIdx);
+	for (int32 i = StartIdx; i < EndExcl; ++i)
+	{
+		UClass* C = AllMatching[i];
+		TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
+		Obj->SetStringField(TEXT("class_path"), C->GetPathName());
+		Obj->SetStringField(TEXT("class_name"), C->GetName());
+		Obj->SetStringField(TEXT("parent_class_path"),
+			C->GetSuperClass() ? C->GetSuperClass()->GetPathName() : FString());
+		Obj->SetBoolField(TEXT("is_abstract"), C->HasAnyClassFlags(CLASS_Abstract));
+		Obj->SetBoolField(TEXT("is_blueprint_generated"), false);  // native-only this tool
+		if (UPackage* Pkg = C->GetOutermost())
+		{
+			Obj->SetStringField(TEXT("source_module"), Pkg->GetName());
+		}
+#if WITH_EDITORONLY_DATA
+		// Class display tooltip if available (metadata-driven; safe in editor).
+		const FText Tooltip = C->GetToolTipText(/*bShortTooltip*/ true);
+		if (!Tooltip.IsEmpty())
+		{
+			Obj->SetStringField(TEXT("description"), Tooltip.ToString());
+		}
+#endif
+		Out.Add(MakeShared<FJsonValueObject>(Obj));
+	}
+
+	TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+	ResultObj->SetArrayField(TEXT("classes"), Out);
+	ResultObj->SetNumberField(TEXT("total_known"), static_cast<double>(TotalKnown));
+	if (EndExcl < TotalKnown && Out.Num() > 0)
+	{
+		FMCPPageCursor NewCursor;
+		NewCursor.FilterHash = FilterHash;
+		NewCursor.LastAssetPath = AllMatching[EndExcl - 1]->GetPathName();
+		NewCursor.TotalKnownSnapshot = TotalKnown;
+		ResultObj->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(NewCursor));
+	}
+	else
+	{
+		ResultObj->SetField(TEXT("next_page_token"), MakeShared<FJsonValueNull>());
+	}
+	return AR_MakeSuccessObj(Request, ResultObj);
+}
+
 // ─── Registration ────────────────────────────────────────────────────────────────────────────
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)
 {
@@ -1410,6 +1714,10 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	RegisterTool(TEXT("asset.get_thumbnail"),         &Tool_AssetGetThumbnail,          /*Lane A*/          false);
 	RegisterTool(TEXT("asset.get_thumbnail_to_disk"), &Tool_AssetGetThumbnailToDisk,    /*Lane A*/          false);
 	RegisterTool(TEXT("asset.get_class_hierarchy"),   &Tool_AssetGetClassHierarchy,     /*Lane A (was B)*/ false);
+
+	// Data Asset creation surface (2026-05): create + discover DA classes.
+	RegisterTool(TEXT("asset.create_data_asset"),       &Tool_AssetCreateDataAsset,       /*Lane A*/          false);
+	RegisterTool(TEXT("asset.list_data_asset_classes"), &Tool_AssetListDataAssetClasses,  /*Lane A*/          false);
 
 	UE_LOG(LogMCP, Log, TEXT("Phase 2 hotfix: registered 13 asset.* handlers (all Lane A — UE 5.7 AR not thread-safe)"));
 }
