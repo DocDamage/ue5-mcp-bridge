@@ -15,6 +15,7 @@
 #include "Tools/AnimTools.h"
 #include "Tools/AssetCompositeTools.h"
 #include "Tools/AssetRegistryTools.h"
+#include "Tools/AudioTools.h"
 #include "Tools/BlueprintCompositeTools.h"
 #include "Tools/BlueprintGraphTools.h"
 #include "Tools/BlueprintTools.h"
@@ -38,6 +39,7 @@
 #include "Tools/TestTools.h"
 #include "Tools/UFunctionTools.h"
 #include "Tools/UMGTools.h"
+#include "Tools/WorldPartitionTools.h"
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -283,6 +285,20 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	//   anim.set_blend_mode   — set BlendIn / BlendOut alpha-blend times
 	// New error codes -32054 SkeletonMismatch, -32055 NotifyTrackNotFound (see MCPTypes.h).
 	FAnimTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Wave C Tier 5c 2026-05: Audio surface (3 tools, all Lane A).
+	//   audio.create_sound_cue  — USoundCue with optional initial USoundWave (no editor pop-up)
+	//   audio.set_attenuation   — set/clear AttenuationSettings on any USoundBase
+	//   audio.list_mix_classes  — enumerate USoundClass + USoundMix assets
+	FAudioTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Wave C Tier 5c 2026-05: WorldPartition surface (3 tools, all Lane A).
+	//   wp.is_partitioned          — UWorld -> GetWorldPartition()
+	//   wp.get_actor_runtime_grid  — AActor::GetRuntimeGrid
+	//   wp.set_actor_runtime_grid  — AActor::SetRuntimeGrid (PIE-guarded)
+	// Scope-reduced from original spec (wp.list_cells / wp.load_cell / wp.set_runtime_grid) —
+	// per-actor runtime-grid edits are the most-needed write op and don't need streaming runtime.
+	FWorldPartitionTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	// Phase 5 Chunk A: PIE surface (10 tools, all Lane A). Inverse PIE-guard: every pie.* tool
 	// except pie.start and pie.is_running requires PIE to BE running; refuses with -32038
