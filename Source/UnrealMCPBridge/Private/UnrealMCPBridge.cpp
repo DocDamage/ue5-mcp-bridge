@@ -12,6 +12,7 @@
 #include "FMCPServer.h"
 #include "MCPTypes.h"
 #include "Tools/ActorTools.h"
+#include "Tools/AnimTools.h"
 #include "Tools/AssetCompositeTools.h"
 #include "Tools/AssetRegistryTools.h"
 #include "Tools/BlueprintCompositeTools.h"
@@ -272,6 +273,16 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// Both PIE-guarded. New error codes -32050 GraphNotFound, -32051 NodeNotFound, -32052
 	// PinNotFound, -32053 PinConnectionRefused (see MCPTypes.h).
 	FBlueprintGraphTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Wave C Tier 5b 2026-05: Animation surface (5 tools, all Lane A).
+	//   anim.list_sequences   — paginated UAnimSequence enumeration
+	//   anim.create_montage   — UAnimMontage from a source sequence (no editor pop-up — replicates
+	//                            UAnimMontageFactory::FactoryCreateNew inline)
+	//   anim.add_section      — append FCompositeSection to a montage
+	//   anim.add_notify       — append FAnimNotifyEvent on a montage notify track
+	//   anim.set_blend_mode   — set BlendIn / BlendOut alpha-blend times
+	// New error codes -32054 SkeletonMismatch, -32055 NotifyTrackNotFound (see MCPTypes.h).
+	FAnimTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	// Phase 5 Chunk A: PIE surface (10 tools, all Lane A). Inverse PIE-guard: every pie.* tool
 	// except pie.start and pie.is_running requires PIE to BE running; refuses with -32038

@@ -330,6 +330,21 @@ inline constexpr int32 kMCPErrorPinNotFound                      = -32052;
 inline constexpr int32 kMCPErrorPinConnectionRefused             = -32053;
 
 /**
+ * Wave C Tier 5b — Animation surface (anim.*).
+ *
+ *   -32054 SkeletonMismatch     ``anim.create_montage`` — the source UAnimSequence's skeleton
+ *                               doesn't match the explicit ``target_skeleton`` argument (when
+ *                               supplied), OR the source has no skeleton at all. Caller's
+ *                               recovery: confirm the source sequence is bound to a USkeleton,
+ *                               or pass the matching ``target_skeleton`` path.
+ *   -32055 NotifyTrackNotFound  ``anim.add_notify`` — the named ``notify_track_name`` doesn't
+ *                               exist on the montage. Caller's recovery: omit the field (auto-
+ *                               creates "Default") or pass an existing track name.
+ */
+inline constexpr int32 kMCPErrorSkeletonMismatch                 = -32054;
+inline constexpr int32 kMCPErrorNotifyTrackNotFound              = -32055;
+
+/**
  * Frozen wire message returned by every Phase 3+ editor-world mutator when PIE is active.
  * **Do NOT edit this string** — smoke tests assert both substrings ``"Phase 5"`` AND ``"pie."``.
  */
