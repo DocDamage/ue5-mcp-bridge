@@ -6,8 +6,10 @@
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPAssetPathUtils.h"
 
+#include "NiagaraComponent.h"
 #include "NiagaraEmitter.h"
 #include "NiagaraEmitterHandle.h"
+#include "NiagaraEmitterFactoryNew.h"
 #include "NiagaraParameterStore.h"
 #include "NiagaraScript.h"
 #include "NiagaraSystem.h"
@@ -15,6 +17,20 @@
 #include "NiagaraUserRedirectionParameterStore.h"
 #include "UObject/Class.h"
 #include "UObject/UObjectGlobals.h"
+
+#include "AssetToolsModule.h"
+#include "Editor.h"
+#include "GameFramework/Actor.h"
+#include "IAssetTools.h"
+#include "Misc/PackageName.h"
+#include "Misc/Paths.h"
+#include "ScopedTransaction.h"
+#include "Subsystems/EditorAssetSubsystem.h"
+#include "UObject/Package.h"
+
+#include "Utils/MCPActorPathUtils.h"
+#include "Utils/MCPAssetPathUtils.h"
+#include "Utils/MCPWorldContext.h"
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -309,6 +325,228 @@ namespace
 		Obj->SetField(TEXT("default"), NIA_DecodeUserParamDefault(Store, Var));
 		return Obj;
 	}
+
+	// ─── value encoding (Wave B niagara.set_user_param) ─────────────────────────────────────────
+
+	/** Read a JSON array of 2/3/4 numeric components into ``OutValues``. Returns false on shape mismatch. */
+	bool NIA_DecodeFloatArray(const TSharedPtr<FJsonValue>& Json, int32 Expected, TArray<float>& OutValues)
+	{
+		if (!Json.IsValid() || Json->Type != EJson::Array) { return false; }
+		const TArray<TSharedPtr<FJsonValue>>& Arr = Json->AsArray();
+		if (Arr.Num() != Expected) { return false; }
+		OutValues.Reset(Expected);
+		for (const TSharedPtr<FJsonValue>& V : Arr)
+		{
+			if (!V.IsValid() || V->Type != EJson::Number) { return false; }
+			OutValues.Add(static_cast<float>(V->AsNumber()));
+		}
+		return true;
+	}
+
+	/**
+	 * Inverse of NIA_DecodeUserParamDefault. Encode a JSON value into a typed byte buffer.
+	 *
+	 * Type coverage matches the decoder. On success populates ``OutBytes`` with the bytewise layout
+	 * the parameter store expects and returns true. On failure returns false; ``OutError`` carries
+	 * a user-facing message (caller wraps in -32602 InvalidParams or -32032 PinTypeUnsupported).
+	 *
+	 * Accepted JSON shapes:
+	 *   float / int32   → JSON Number (int truncated; bool not accepted to keep types tight)
+	 *   bool / FNiagaraBool → JSON Boolean  OR  Number (!=0 → true)
+	 *   FVector2f       → [x, y]
+	 *   FVector3f / FNiagaraPosition → [x, y, z]
+	 *   FVector4f / FQuat4f → [x, y, z, w]
+	 *   FLinearColor    → [r, g, b, a]  OR  {r:f, g:f, b:f, a:f}  (a optional, defaults to 1.0)
+	 */
+	bool NIA_EncodeUserParamValue(
+		const FNiagaraVariable& Var,
+		const TSharedPtr<FJsonValue>& Json,
+		TArray<uint8>& OutBytes,
+		FString& OutError,
+		bool& bOutIsUnsupportedType)
+	{
+		bOutIsUnsupportedType = false;
+		if (!Json.IsValid())
+		{
+			OutError = TEXT("value is missing or null");
+			return false;
+		}
+
+		const FNiagaraTypeDefinition& Type = Var.GetType();
+		auto IsSameBase = [&Type](const FNiagaraTypeDefinition& Reference)
+		{
+			return Type.IsSameBaseDefinition(Reference);
+		};
+
+		// ─── scalar float ─────────────────────────────────────────────────────────────────────────
+		if (IsSameBase(FNiagaraTypeDefinition::GetFloatDef()))
+		{
+			if (Json->Type != EJson::Number)
+			{
+				OutError = FString::Printf(TEXT("expected JSON number for float param '%s'"), *Var.GetName().ToString());
+				return false;
+			}
+			const float V = static_cast<float>(Json->AsNumber());
+			OutBytes.SetNumUninitialized(sizeof(float));
+			FMemory::Memcpy(OutBytes.GetData(), &V, sizeof(float));
+			return true;
+		}
+
+		// ─── scalar int32 ─────────────────────────────────────────────────────────────────────────
+		if (IsSameBase(FNiagaraTypeDefinition::GetIntDef()))
+		{
+			if (Json->Type != EJson::Number)
+			{
+				OutError = FString::Printf(TEXT("expected JSON number for int param '%s'"), *Var.GetName().ToString());
+				return false;
+			}
+			const int32 V = static_cast<int32>(Json->AsNumber());
+			OutBytes.SetNumUninitialized(sizeof(int32));
+			FMemory::Memcpy(OutBytes.GetData(), &V, sizeof(int32));
+			return true;
+		}
+
+		// ─── bool / FNiagaraBool ─────────────────────────────────────────────────────────────────
+		if (IsSameBase(FNiagaraTypeDefinition::GetBoolDef()))
+		{
+			bool bValue = false;
+			if (Json->Type == EJson::Boolean)        { bValue = Json->AsBool(); }
+			else if (Json->Type == EJson::Number)    { bValue = (Json->AsNumber() != 0.0); }
+			else
+			{
+				OutError = FString::Printf(TEXT("expected JSON bool or number for bool param '%s'"), *Var.GetName().ToString());
+				return false;
+			}
+			// FNiagaraBool stores int32 (32-bit) — non-zero means true, exactly the value 0xFFFFFFFF (-1)
+			// in the engine's serialization. We follow the engine convention (FNiagaraBool::True = 0xFFFFFFFF).
+			const int32 V = bValue ? -1 : 0;
+			OutBytes.SetNumUninitialized(sizeof(int32));
+			FMemory::Memcpy(OutBytes.GetData(), &V, sizeof(int32));
+			return true;
+		}
+
+		// ─── FVector2f ───────────────────────────────────────────────────────────────────────────
+		if (IsSameBase(FNiagaraTypeDefinition::GetVec2Def()))
+		{
+			TArray<float> Components;
+			if (!NIA_DecodeFloatArray(Json, 2, Components))
+			{
+				OutError = FString::Printf(TEXT("expected JSON [x,y] for Vec2 param '%s'"), *Var.GetName().ToString());
+				return false;
+			}
+			OutBytes.SetNumUninitialized(sizeof(FVector2f));
+			FMemory::Memcpy(OutBytes.GetData(), Components.GetData(), sizeof(FVector2f));
+			return true;
+		}
+
+		// ─── FVector3f / FNiagaraPosition ────────────────────────────────────────────────────────
+		if (IsSameBase(FNiagaraTypeDefinition::GetVec3Def()) || IsSameBase(FNiagaraTypeDefinition::GetPositionDef()))
+		{
+			TArray<float> Components;
+			if (!NIA_DecodeFloatArray(Json, 3, Components))
+			{
+				OutError = FString::Printf(TEXT("expected JSON [x,y,z] for Vec3 param '%s'"), *Var.GetName().ToString());
+				return false;
+			}
+			OutBytes.SetNumUninitialized(sizeof(FVector3f));
+			FMemory::Memcpy(OutBytes.GetData(), Components.GetData(), sizeof(FVector3f));
+			return true;
+		}
+
+		// ─── FVector4f / FQuat4f ─────────────────────────────────────────────────────────────────
+		if (IsSameBase(FNiagaraTypeDefinition::GetVec4Def()) || IsSameBase(FNiagaraTypeDefinition::GetQuatDef()))
+		{
+			TArray<float> Components;
+			if (!NIA_DecodeFloatArray(Json, 4, Components))
+			{
+				OutError = FString::Printf(TEXT("expected JSON [x,y,z,w] for Vec4/Quat param '%s'"), *Var.GetName().ToString());
+				return false;
+			}
+			OutBytes.SetNumUninitialized(sizeof(FVector4f));
+			FMemory::Memcpy(OutBytes.GetData(), Components.GetData(), sizeof(FVector4f));
+			return true;
+		}
+
+		// ─── FLinearColor ────────────────────────────────────────────────────────────────────────
+		if (IsSameBase(FNiagaraTypeDefinition::GetColorDef()))
+		{
+			FLinearColor C(0, 0, 0, 1);
+			if (Json->Type == EJson::Array)
+			{
+				TArray<float> Components;
+				const int32 N = Json->AsArray().Num();
+				if (N != 3 && N != 4)
+				{
+					OutError = FString::Printf(TEXT("expected JSON [r,g,b] or [r,g,b,a] for LinearColor param '%s'"), *Var.GetName().ToString());
+					return false;
+				}
+				if (!NIA_DecodeFloatArray(Json, N, Components))
+				{
+					OutError = FString::Printf(TEXT("LinearColor components must all be numbers for param '%s'"), *Var.GetName().ToString());
+					return false;
+				}
+				C.R = Components[0]; C.G = Components[1]; C.B = Components[2];
+				if (N == 4) { C.A = Components[3]; }
+			}
+			else if (Json->Type == EJson::Object)
+			{
+				const TSharedPtr<FJsonObject>& Obj = Json->AsObject();
+				double R = 0, G = 0, B = 0, A = 1.0;
+				if (!Obj->TryGetNumberField(TEXT("r"), R) ||
+				    !Obj->TryGetNumberField(TEXT("g"), G) ||
+				    !Obj->TryGetNumberField(TEXT("b"), B))
+				{
+					OutError = FString::Printf(TEXT("expected {r,g,b,a?} JSON object for LinearColor param '%s'"), *Var.GetName().ToString());
+					return false;
+				}
+				Obj->TryGetNumberField(TEXT("a"), A);
+				C.R = static_cast<float>(R);
+				C.G = static_cast<float>(G);
+				C.B = static_cast<float>(B);
+				C.A = static_cast<float>(A);
+			}
+			else
+			{
+				OutError = FString::Printf(TEXT("expected JSON array or object for LinearColor param '%s'"), *Var.GetName().ToString());
+				return false;
+			}
+			OutBytes.SetNumUninitialized(sizeof(FLinearColor));
+			FMemory::Memcpy(OutBytes.GetData(), &C, sizeof(FLinearColor));
+			return true;
+		}
+
+		// Fall-through — unsupported type (DataInterface / UObject / custom struct).
+		bOutIsUnsupportedType = true;
+		OutError = FString::Printf(
+			TEXT("user_param '%s' has unsupported type '%s' (DataInterface / UObject / custom struct); ")
+			TEXT("only float/int/bool/Vec2/Vec3/Vec4/Quat/LinearColor/Position are supported"),
+			*Var.GetName().ToString(), *Type.GetName());
+		return false;
+	}
+
+	/** Find a Niagara user-param by FName. Returns whether it was found + writes Var by-ref. */
+	bool NIA_FindUserParamByName(
+		const FNiagaraUserRedirectionParameterStore& Store,
+		const FString& Name,
+		FNiagaraVariable& OutVar)
+	{
+		// User parameters often come prefixed by "User." (the redirection store strips it on lookup).
+		// We accept both shapes — bare name OR "User.Name" — for caller ergonomics.
+		const FName Target(*Name);
+		const FName TargetWithPrefix = Name.StartsWith(TEXT("User.")) ? Target : FName(*(FString(TEXT("User.")) + Name));
+
+		TArray<FNiagaraVariable> Vars;
+		Store.GetUserParameters(Vars);
+		for (const FNiagaraVariable& V : Vars)
+		{
+			if (V.GetName() == Target || V.GetName() == TargetWithPrefix)
+			{
+				OutVar = V;
+				return true;
+			}
+		}
+		return false;
+	}
 } // namespace
 
 namespace FNiagaraTools
@@ -421,6 +659,320 @@ FMCPResponse Tool_ListParameters(const FMCPRequest& Request)
 	return NIA_MakeSuccessObj(Request, Out);
 }
 
+// ─── niagara.set_user_param ───────────────────────────────────────────────────────────────────
+//
+// Args:    { niagara_system_path: string, name: string, value: <JSON typed> }
+// Result:  { changed: bool, name: string, type: string, prior: <prior_value>, new: <new_value> }
+//
+// Errors:
+//   -32602 InvalidParams                missing args / wrong shape
+//   -32010 InvalidPath                  niagara_system_path malformed / unknown mount
+//   -32004 ObjectNotFound               system asset can't load
+//   -32011 WrongClass                   asset isn't UNiagaraSystem
+//   -32027 PIEActive                    PIE running; mutation refused
+//   -32040 NiagaraParameterNotFound     ``name`` not present in user-param store
+//   -32032 PinTypeUnsupported           parameter's FNiagaraTypeDefinition isn't in the encoder map
+//   -32603 InternalError                SetParameterData refused (extremely rare)
+FMCPResponse Tool_SetUserParam(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	// PIE guard — Niagara assets are shared between editor + PIE worlds, so mutating during PIE
+	// would race the live simulation; refuse exactly like every other Phase 4+ asset-mutator.
+	if (FMCPWorldContext::IsPIEActive())
+	{
+		return NIA_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+	}
+
+	FString Path, Name;
+	FMCPResponse Err;
+	if (!NIA_RequireStringField(Request, TEXT("niagara_system_path"), Path, Err)) { return Err; }
+	if (!NIA_RequireStringField(Request, TEXT("name"),                Name, Err)) { return Err; }
+
+	if (!Request.Args.IsValid() || !Request.Args->HasField(TEXT("value")))
+	{
+		return NIA_MakeError(Request, kNIAErrorInvalidParams,
+			TEXT("niagara.set_user_param requires args.value (typed JSON: number / bool / array / object)"));
+	}
+	const TSharedPtr<FJsonValue> ValueJson = Request.Args->TryGetField(TEXT("value"));
+
+	int32 ErrCode = 0;
+	FString ErrMsg;
+	UNiagaraSystem* System = NIA_LoadNiagaraSystemByPath(Path, ErrCode, ErrMsg);
+	if (!System) { return NIA_MakeError(Request, ErrCode, ErrMsg); }
+
+	FNiagaraUserRedirectionParameterStore& UserStore = System->GetExposedParameters();
+	FNiagaraVariable Var;
+	if (!NIA_FindUserParamByName(UserStore, Name, Var))
+	{
+		return NIA_MakeError(Request, kMCPErrorNiagaraParameterNotFound,
+			FString::Printf(
+				TEXT("user_param '%s' not found on '%s' (call niagara.list_parameters for the inventory)"),
+				*Name, *System->GetPathName()));
+	}
+
+	// Capture prior value first (for round-trip diff) BEFORE we mutate the store.
+	TSharedPtr<FJsonValue> Prior = NIA_DecodeUserParamDefault(UserStore, Var);
+
+	// Encode JSON → byte buffer (typed per FNiagaraTypeDefinition).
+	TArray<uint8> Bytes;
+	FString EncodeError;
+	bool bUnsupportedType = false;
+	if (!NIA_EncodeUserParamValue(Var, ValueJson, Bytes, EncodeError, bUnsupportedType))
+	{
+		const int32 Code = bUnsupportedType ? kMCPErrorPinTypeUnsupported : kNIAErrorInvalidParams;
+		return NIA_MakeError(Request, Code, EncodeError);
+	}
+
+	// ─── apply ───────────────────────────────────────────────────────────────────────────────────
+	// Open a scoped transaction so the editor's Undo stack picks the change up alongside System->Modify
+	// (artists expect Ctrl-Z to revert).
+	FScopedTransaction Transaction(LOCTEXT("MCP_SetNiagaraUserParam", "Set Niagara user parameter"));
+	System->Modify();
+
+	// SetParameterData mutates the parameter store in place. ``bAdd=false`` because we already
+	// verified the variable exists (NIA_FindUserParamByName); passing true would silently inject
+	// a phantom variable if our lookup ever went stale.
+	const bool bWriteOk = UserStore.SetParameterData(Bytes.GetData(), Var, /*bAdd*/ false);
+	if (!bWriteOk)
+	{
+		return NIA_MakeError(Request, kNIAErrorInternal,
+			FString::Printf(
+				TEXT("FNiagaraUserRedirectionParameterStore::SetParameterData failed for '%s' on '%s' (param vanished or type mismatch)"),
+				*Var.GetName().ToString(), *System->GetPathName()));
+	}
+
+	// The store doesn't fire change broadcasts by itself; UNiagaraSystem::OnSystemPostEditChange
+	// is the canonical re-bind hook so PIE components pick up the new value next tick. We don't
+	// have direct access to it, but Modify()+MarkPackageDirty() is what the editor's own user-param
+	// panel does — that's enough for the asset to round-trip on the next save.
+
+	if (UPackage* Pkg = System->GetOutermost()) { Pkg->MarkPackageDirty(); }
+
+	// Decode-after-write so the response carries the canonical "as the store sees it" value.
+	TSharedPtr<FJsonValue> NewValue = NIA_DecodeUserParamDefault(UserStore, Var);
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetBoolField(TEXT("changed"), true);
+	Out->SetStringField(TEXT("name"), Var.GetName().ToString());
+	Out->SetStringField(TEXT("type"), Var.GetType().GetName());
+	Out->SetField(TEXT("prior"), Prior);
+	Out->SetField(TEXT("new"),   NewValue);
+	return NIA_MakeSuccessObj(Request, Out);
+}
+
+// ─── niagara.create_emitter ───────────────────────────────────────────────────────────────────
+//
+// Args:    { dest_path: string, save?: bool, add_default_modules?: bool }
+// Result:  { created: bool, asset_path: string, saved: bool }
+//
+// Args.add_default_modules (default true) controls UNiagaraEmitterFactoryNew's
+// bAddDefaultModulesAndRenderersToEmptyEmitter — when true the factory creates a default
+// "Sprite Renderer + Initialize Particle / Particle Update" stack so the emitter is immediately
+// runnable in the editor preview; when false the result is a bare emitter that the caller must
+// populate via subsequent editor edits.
+//
+// Errors:
+//   -32602 InvalidParams      missing dest_path
+//   -32010 InvalidPath        dest_path malformed / unknown mount
+//   -32014 PathInUse          dest_path already exists on disk
+//   -32027 PIEActive          PIE running; asset creation refused
+//   -32603 InternalError      IAssetTools::CreateAsset returned null
+FMCPResponse Tool_CreateEmitter(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (FMCPWorldContext::IsPIEActive())
+	{
+		return NIA_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+	}
+
+	FString DestPathRaw;
+	FMCPResponse Err;
+	if (!NIA_RequireStringField(Request, TEXT("dest_path"), DestPathRaw, Err)) { return Err; }
+
+	const FString DestPathNorm = FMCPAssetPathUtils::Normalize(DestPathRaw);
+	if (DestPathNorm.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(DestPathNorm))
+	{
+		return NIA_MakeError(Request, kMCPErrorInvalidPath,
+			FString::Printf(
+				TEXT("dest_path '%s' is malformed or references an unknown mount (need /Game/... or /Plugin/...)"),
+				*DestPathRaw));
+	}
+	if (FPackageName::DoesPackageExist(DestPathNorm))
+	{
+		return NIA_MakeError(Request, kMCPErrorPathInUse,
+			FString::Printf(TEXT("dest_path '%s' already exists on disk"), *DestPathNorm));
+	}
+
+	bool bAddDefaultModules = true;
+	Request.Args->TryGetBoolField(TEXT("add_default_modules"), bAddDefaultModules);
+
+	// Configure factory state BEFORE IAssetTools::CreateAsset — UNiagaraEmitterFactoryNew's
+	// FactoryCreateNew reads these fields directly (ConfigureProperties only runs in interactive
+	// "New Asset" UI dialogs, which CreateAsset bypasses).
+	UNiagaraEmitterFactoryNew* Factory = NewObject<UNiagaraEmitterFactoryNew>();
+	Factory->EmitterToCopy = nullptr;
+	Factory->bUseInheritance = false;
+	Factory->bAddDefaultModulesAndRenderersToEmptyEmitter = bAddDefaultModules;
+
+	const FString PackagePath = FPaths::GetPath(DestPathNorm);
+	const FString AssetName   = FPaths::GetBaseFilename(DestPathNorm);
+
+	IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get();
+	UObject* NewAsset = AssetTools.CreateAsset(AssetName, PackagePath, UNiagaraEmitter::StaticClass(), Factory);
+	if (!NewAsset)
+	{
+		return NIA_MakeError(Request, kNIAErrorInternal,
+			FString::Printf(TEXT("IAssetTools::CreateAsset returned null for emitter %s/%s "
+				"(factory may have rejected; check editor log)"),
+				*PackagePath, *AssetName));
+	}
+
+	if (UPackage* Pkg = NewAsset->GetOutermost()) { Pkg->MarkPackageDirty(); }
+
+	bool bSaveRequested = false;
+	bool bSavedOk       = false;
+	Request.Args->TryGetBoolField(TEXT("save"), bSaveRequested);
+	if (bSaveRequested)
+	{
+		if (UEditorAssetSubsystem* EAS = GEditor ? GEditor->GetEditorSubsystem<UEditorAssetSubsystem>() : nullptr)
+		{
+			bSavedOk = EAS->SaveLoadedAsset(NewAsset, /*bOnlyIfIsDirty*/ true);
+		}
+	}
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetBoolField(TEXT("created"), true);
+	Out->SetStringField(TEXT("asset_path"), NewAsset->GetPathName());
+	Out->SetBoolField(TEXT("saved"), bSavedOk);
+	Out->SetBoolField(TEXT("default_modules"), bAddDefaultModules);
+	return NIA_MakeSuccessObj(Request, Out);
+}
+
+// ─── niagara.set_emitter_enabled ──────────────────────────────────────────────────────────────
+//
+// Args:    { actor_path: string, emitter_index: number, enabled: bool, component_name?: string }
+// Result:  { actor_path, emitter_name, emitter_index, enabled, component_name }
+//
+// Targets a placed AActor that has at least one UNiagaraComponent; flips one emitter's enable
+// state via UNiagaraComponent::SetEmitterEnable. Lookup by emitter_index in the component's
+// UNiagaraSystem.GetEmitterHandles() list. component_name optional — when there are multiple
+// Niagara components on the actor it picks the named one; otherwise the first attached.
+//
+// NO PIE guard — works in editor world (component simulates in editor unless explicitly paused)
+// AND PIE. Mutates only runtime component state (not asset).
+//
+// Errors:
+//   -32602 InvalidParams      missing args
+//   -32004 ObjectNotFound     actor or component missing
+//   -32011 WrongClass         actor has no UNiagaraComponent
+//   -32026 PropertyIndexOOB   emitter_index out of range for the component's system
+//   -32024 AmbiguousComponent multiple Niagara components, no component_name to disambiguate
+FMCPResponse Tool_SetEmitterEnabled(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	FString ActorPath;
+	FMCPResponse Err;
+	if (!NIA_RequireStringField(Request, TEXT("actor_path"), ActorPath, Err)) { return Err; }
+
+	int32 EmitterIndex = -1;
+	if (!Request.Args->TryGetNumberField(TEXT("emitter_index"), EmitterIndex) || EmitterIndex < 0)
+	{
+		return NIA_MakeError(Request, kNIAErrorInvalidParams,
+			TEXT("niagara.set_emitter_enabled requires args.emitter_index (non-negative integer)"));
+	}
+
+	bool bEnabled = false;
+	if (!Request.Args->TryGetBoolField(TEXT("enabled"), bEnabled))
+	{
+		return NIA_MakeError(Request, kNIAErrorInvalidParams,
+			TEXT("niagara.set_emitter_enabled requires args.enabled (bool)"));
+	}
+
+	FString ComponentName;
+	Request.Args->TryGetStringField(TEXT("component_name"), ComponentName);
+
+	bool bAmbiguous = false;
+	FString AmbiguityHint, ResolveErr;
+	AActor* Actor = FMCPActorPathUtils::ResolveActor(ActorPath, /*bRejectPIE*/ false, bAmbiguous, AmbiguityHint, ResolveErr);
+	if (!Actor)
+	{
+		return NIA_MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("actor '%s' not found: %s%s"),
+				*ActorPath, *ResolveErr, bAmbiguous ? *(FString(TEXT(" (candidates: ")) + AmbiguityHint + TEXT(")")) : TEXT("")));
+	}
+
+	// Collect Niagara components attached to the actor.
+	TArray<UNiagaraComponent*> NiagaraComps;
+	Actor->GetComponents<UNiagaraComponent>(NiagaraComps);
+	if (NiagaraComps.Num() == 0)
+	{
+		return NIA_MakeError(Request, kMCPErrorWrongClass,
+			FString::Printf(TEXT("actor '%s' has no UNiagaraComponent"), *Actor->GetPathName()));
+	}
+
+	UNiagaraComponent* TargetComp = nullptr;
+	if (!ComponentName.IsEmpty())
+	{
+		for (UNiagaraComponent* C : NiagaraComps)
+		{
+			if (C && C->GetName() == ComponentName) { TargetComp = C; break; }
+		}
+		if (!TargetComp)
+		{
+			return NIA_MakeError(Request, kMCPErrorObjectNotFound,
+				FString::Printf(TEXT("UNiagaraComponent named '%s' not found on actor '%s'"),
+					*ComponentName, *Actor->GetPathName()));
+		}
+	}
+	else if (NiagaraComps.Num() > 1)
+	{
+		FString CandidateList;
+		for (int32 i = 0; i < NiagaraComps.Num() && i < 8; ++i)
+		{
+			CandidateList += (i == 0 ? TEXT("") : TEXT(", "));
+			CandidateList += NiagaraComps[i]->GetName();
+		}
+		return NIA_MakeError(Request, kMCPErrorAmbiguousComponent,
+			FString::Printf(TEXT("actor '%s' has %d UNiagaraComponents; pass component_name to disambiguate (candidates: %s)"),
+				*Actor->GetPathName(), NiagaraComps.Num(), *CandidateList));
+	}
+	else
+	{
+		TargetComp = NiagaraComps[0];
+	}
+	check(TargetComp);
+
+	UNiagaraSystem* SysAsset = TargetComp->GetAsset();
+	if (!SysAsset)
+	{
+		return NIA_MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("UNiagaraComponent '%s' on actor '%s' has no system asset bound"),
+				*TargetComp->GetName(), *Actor->GetPathName()));
+	}
+
+	const TArray<FNiagaraEmitterHandle>& Handles = SysAsset->GetEmitterHandles();
+	if (EmitterIndex >= Handles.Num())
+	{
+		return NIA_MakeError(Request, kMCPErrorPropertyIndexOOB,
+			FString::Printf(TEXT("emitter_index %d out of range (system has %d emitters)"),
+				EmitterIndex, Handles.Num()));
+	}
+
+	const FName EmitterFName = Handles[EmitterIndex].GetName();
+	TargetComp->SetEmitterEnable(EmitterFName, bEnabled);
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetStringField(TEXT("actor_path"), Actor->GetPathName());
+	Out->SetStringField(TEXT("component_name"), TargetComp->GetName());
+	Out->SetStringField(TEXT("emitter_name"), EmitterFName.ToString());
+	Out->SetNumberField(TEXT("emitter_index"), static_cast<double>(EmitterIndex));
+	Out->SetBoolField(TEXT("enabled"), bEnabled);
+	return NIA_MakeSuccessObj(Request, Out);
+}
+
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)
 {
@@ -430,10 +982,14 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 		OutRegisteredMethodNames.Add(MethodName);
 	};
 
-	RegisterTool(TEXT("niagara.list_parameters"), &Tool_ListParameters, /*Lane A*/ false);
+	RegisterTool(TEXT("niagara.list_parameters"),     &Tool_ListParameters,    /*Lane A*/ false);
+	// Wave B (2026-05): Niagara write surface.
+	RegisterTool(TEXT("niagara.set_user_param"),      &Tool_SetUserParam,      /*Lane A*/ false);
+	RegisterTool(TEXT("niagara.create_emitter"),      &Tool_CreateEmitter,     /*Lane A*/ false);
+	RegisterTool(TEXT("niagara.set_emitter_enabled"), &Tool_SetEmitterEnabled, /*Lane A*/ false);
 
 	UE_LOG(LogMCP, Log,
-		TEXT("Phase 5 Chunk C (Niagara): registered 1 niagara.* handler (list_parameters, Lane A)"));
+		TEXT("Niagara surface registered: 1 read (list_parameters) + 3 writes (set_user_param / create_emitter / set_emitter_enabled), all Lane A"));
 }
 
 } // namespace FNiagaraTools

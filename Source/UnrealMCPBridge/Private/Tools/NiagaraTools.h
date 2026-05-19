@@ -8,10 +8,14 @@
 class FMCPDispatchQueue;
 
 /**
- * Phase 5 — Chunk C, Category D (Niagara read-only). 1 user-visible tool, Lane A.
+ * Phase 5 — Chunk C, Category D (Niagara read-only) + Wave B (Niagara writes).
+ * 4 user-visible tools, all Lane A.
  *
- * Tool roster (per Phase 5 plan §C-Niagara lines 762-795):
- *   niagara.list_parameters  → enumerate user / system / emitter-scoped parameters of a Niagara System
+ * Tool roster:
+ *   niagara.list_parameters       → enumerate user / system / emitter-scoped parameters of a System (Phase 5)
+ *   niagara.set_user_param        → write a typed value into UNiagaraSystem::GetExposedParameters() (Wave B)
+ *   niagara.create_emitter        → spawn a UNiagaraEmitter asset via UNiagaraEmitterFactoryNew (Wave B)
+ *   niagara.set_emitter_enabled   → toggle UNiagaraComponent::SetEmitterEnable on a placed actor (Wave B)
  *
  * **Lane A only** (``bThreadSafe=false``). Reasons:
  *   - ``LoadObject<UNiagaraSystem>`` may trigger asset-load delegates + shader-cache touches; GT-only.
@@ -58,4 +62,22 @@ namespace FNiagaraTools
 
 	// ─── Category D: Niagara read-only ──────────────────────────────────────────────────────────
 	UNREALMCPBRIDGE_API FMCPResponse Tool_ListParameters(const FMCPRequest& Request);
+
+	// ─── Wave B: Niagara writes (3 tools) ───────────────────────────────────────────────────────
+	//
+	// Tool_SetUserParam — write a user parameter on a UNiagaraSystem asset. Decodes JSON value
+	//   per FNiagaraTypeDefinition (float/int/bool/Vec2/3/4/Quat/LinearColor/Position). Mutator,
+	//   PIE-guarded. Returns prior value for round-trip diff. Marks package dirty.
+	//
+	// Tool_CreateEmitter — create an empty UNiagaraEmitter asset at dest_path via
+	//   UNiagaraEmitterFactoryNew (no parent emitter, no default modules). Caller wires modules
+	//   via editor UI or future graph-editing tools. Lane A; PIE-guarded.
+	//
+	// Tool_SetEmitterEnabled — toggle one emitter inside a placed UNiagaraComponent at runtime.
+	//   Reads UNiagaraSystem::GetEmitterHandles() to map emitter_index → FName, then calls
+	//   UNiagaraComponent::SetEmitterEnable. Works in editor world (component simulates in
+	//   editor unless explicitly paused) AND PIE — NO PIE guard. Touches no asset state.
+	UNREALMCPBRIDGE_API FMCPResponse Tool_SetUserParam(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_CreateEmitter(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_SetEmitterEnabled(const FMCPRequest& Request);
 }

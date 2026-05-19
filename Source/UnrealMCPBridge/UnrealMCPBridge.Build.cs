@@ -86,9 +86,12 @@ public class UnrealMCPBridge : ModuleRules
 				"UMGEditor",                // UWidgetBlueprint — Cast<UWidgetBlueprint> + WidgetTree access.
 				// Niagara runtime — UNiagaraSystem / UNiagaraEmitter / FNiagaraParameterStore /
 				// FNiagaraUserRedirectionParameterStore / FNiagaraVariable + FNiagaraTypeDefinition
-				// (niagara.list_parameters read-only enumeration). NiagaraEditor NOT needed for
-				// read-side enumeration — exposed parameters live on the runtime UNiagaraSystem.
-				"Niagara",                  // UNiagaraSystem::GetExposedParameters / GetEmitterHandles.
+				// (niagara.list_parameters read-only enumeration).
+				"Niagara",                  // UNiagaraSystem::GetExposedParameters / GetEmitterHandles
+				                            // + UNiagaraComponent::SetEmitterEnable (niagara.set_emitter_enabled).
+				// Wave B 2026-05 — Niagara writes need UNiagaraEmitterFactoryNew (niagara.create_emitter).
+				// NiagaraEditor is editor-only — fine for the bridge (UnrealMCPBridge is editor-only too).
+				"NiagaraEditor",            // UNiagaraEmitterFactoryNew.
 				// Physics traces (physics.line_trace / sweep_capsule) — UWorld::LineTraceMultiByChannel
 				// / SweepMultiByChannel + FCollisionShape::MakeCapsule + FCollisionQueryParams +
 				// ECollisionChannel + FHitResult are all in Engine (already a public dep). No additional
