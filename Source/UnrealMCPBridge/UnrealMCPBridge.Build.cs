@@ -144,6 +144,12 @@ public class UnrealMCPBridge : ModuleRules
 				// module (editor-only — fine, the plugin is editor-only too). AnimGraphRuntime is
 				// pulled transitively (AnimGraph publicly depends on AnimGraphRuntime).
 				"AnimGraph",
+				// Wave H Surface 3 2026-05 — Data validation surface.
+				// UEditorValidatorSubsystem / UEditorValidatorBase live in the DataValidation
+				// plugin module (editor-only, shipped with Engine — Plugins/Editor/DataValidation).
+				// FDataValidationContext + EDataValidationResult are in CoreUObject (already
+				// transitively linked via UnrealEd → Engine → CoreUObject).
+				"DataValidation",
 			}
 		);
 

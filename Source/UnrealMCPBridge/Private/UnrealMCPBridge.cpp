@@ -26,6 +26,7 @@
 #include "Tools/ContentBrowserTools.h"
 #include "Tools/CurveTools.h"
 #include "Tools/DataTableTools.h"
+#include "Tools/DataValidationTools.h"
 #include "Tools/DebugTools.h"
 #include "Tools/EditorTools.h"
 #include "Tools/EngineTools.h"
@@ -722,6 +723,25 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// Reuses existing error codes - no new codes introduced: -32004 / -32010 / -32011 / -32015 /
 	// -32027 / -32602 / -32603. No new Build.cs deps - all curve headers in Engine (already linked).
 	FCurveTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Wave H Surface 3 2026-05: Editor data-validation surface (3 tools, all Lane A, no PIE guard).
+	//   data_validation.validate_asset   - UEditorValidatorSubsystem::IsObjectValidWithContext on
+	//                                       a single loaded asset; reports result ("valid"|"invalid"|
+	//                                       "not_validated"), errors[], warnings[], validators_run.
+	//   data_validation.validate_path    - AR walk under path_prefix + per-asset
+	//                                       IsObjectValidWithContext; reports aggregate counts
+	//                                       (total_validated/valid_count/invalid_count/
+	//                                       not_validated_count) + failures[] detail (every non-Valid
+	//                                       asset). max_assets hard cap = 10000, default 1000.
+	//   data_validation.list_validators  - TObjectIterator<UClass> filtered to concrete
+	//                                       UEditorValidatorBase subclasses; per-entry class_path +
+	//                                       is_enabled (from CDO->IsEnabled()) + description
+	//                                       (UClass::GetDisplayNameText). Lists CLASSES not registered
+	//                                       INSTANCES - see header for caveat.
+	// All 3 tools are read-only - no PIE guard, no FScopedTransaction, no MarkPackageDirty.
+	// Reuses existing error codes - no new codes introduced: -32004 / -32010 / -32602 / -32603.
+	// Build.cs adds DataValidation private dep (editor plugin module shipped with Engine).
+	FDataValidationTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	UE_LOG(LogMCP, Log,
 		TEXT("Registered dispatch handlers: kind=ExecPython → FMCPPythonEval::EvalExpression, ")
