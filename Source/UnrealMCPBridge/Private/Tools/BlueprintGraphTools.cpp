@@ -6,6 +6,7 @@
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPBlueprintUtils.h"
 #include "Utils/MCPPinTypeUtils.h"
+#include "Utils/MCPReflection.h"
 #include "Utils/MCPWorldContext.h"
 
 #include "EdGraph/EdGraph.h"
@@ -17,12 +18,15 @@
 #include "K2Node_CallFunction.h"
 #include "K2Node_CustomEvent.h"
 #include "K2Node_Event.h"
+#include "K2Node_FunctionEntry.h"
+#include "K2Node_FunctionResult.h"
 #include "K2Node_VariableGet.h"
 #include "K2Node_VariableSet.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "ScopedTransaction.h"
 #include "UObject/Class.h"
 #include "UObject/Package.h"
+#include "UObject/UnrealType.h"
 #include "UObject/UObjectGlobals.h"
 
 #include "Dom/JsonObject.h"
@@ -116,6 +120,32 @@ namespace
 			if (N && N->NodeGuid == Guid) { return N; }
 		}
 		return nullptr;
+	}
+
+	/**
+	 * Snapshot a pin's current default state as a JSON object — used by ``bp.set_pin_default`` to
+	 * report ``prior_default`` and ``new_default``. Surface BOTH ``default_value`` (the string the
+	 * schema produces for primitives / enums / structs) AND ``default_object`` (the path of a hard
+	 * UObject default), since callers can't always predict which slot the schema chose. ``null``
+	 * fields encode "not set" — a clean default for an unconnected primitive pin emits
+	 * ``{default_value:"", default_object:null, default_text:""}`` whereas an object pin holding a
+	 * mesh reference emits ``{default_value:"", default_object:"/Game/...", default_text:""}``.
+	 */
+	TSharedRef<FJsonObject> BGT_BuildPinDefaultSnapshot(const UEdGraphPin* Pin)
+	{
+		TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
+		if (!Pin) { return Obj; }
+		Obj->SetStringField(TEXT("default_value"), Pin->DefaultValue);
+		if (Pin->DefaultObject)
+		{
+			Obj->SetStringField(TEXT("default_object"), Pin->DefaultObject->GetPathName());
+		}
+		else
+		{
+			Obj->SetField(TEXT("default_object"), MakeShared<FJsonValueNull>());
+		}
+		Obj->SetStringField(TEXT("default_text"), Pin->DefaultTextValue.ToString());
+		return Obj;
 	}
 
 	/** Build JSON {name, direction, pin_type} for a single UEdGraphPin (no LinkedTo for brevity). */
@@ -438,6 +468,574 @@ FMCPResponse Tool_ConnectPins(const FMCPRequest& Request)
 	return BGT_MakeSuccessObj(Request, Out);
 }
 
+// ─── bp.set_node_property ──────────────────────────────────────────────────────────────────────
+//
+// Args:    { blueprint_path, graph_name?, node_guid, property_name, value: <JSON> }
+// Result:  { node_guid, property_name, prior_value, new_value }
+//
+// Reuses the Phase-2 ``FMCPReflection::WritePropertyValueAt`` pipeline so JSON-typed values for
+// vectors / enums / object refs / structs round-trip identically to ``marshall.write_property``.
+// Wrapped in ``FMCPWritePropertyScope`` for the 4-step (PreEditChange → Modify → write →
+// PostEditChangeProperty) contract. ``Node->ReconstructNode`` follows the write so pin layout
+// reflects property-driven pin changes (e.g. ``bIsPureFunc`` toggling exec pins).
+//
+// Errors: -32050 GraphNotFound, -32051 NodeNotFound, -32005 PropertyNotFound,
+//         -32006 PropertyTypeMismatch, -32027 PIEActive.
+FMCPResponse Tool_SetNodeProperty(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (FMCPWorldContext::IsPIEActive())
+	{
+		return BGT_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+	}
+
+	FString BlueprintPath, NodeGuidStr, PropertyName;
+	FMCPResponse Err;
+	if (!BGT_RequireStringField(Request, TEXT("blueprint_path"),  BlueprintPath, Err)) { return Err; }
+	if (!BGT_RequireStringField(Request, TEXT("node_guid"),       NodeGuidStr,   Err)) { return Err; }
+	if (!BGT_RequireStringField(Request, TEXT("property_name"),   PropertyName,  Err)) { return Err; }
+
+	const TSharedPtr<FJsonValue> ValueField = Request.Args->TryGetField(TEXT("value"));
+	if (!ValueField.IsValid())
+	{
+		return BGT_MakeError(Request, kBGTErrorInvalidParams,
+			TEXT("missing required field 'value' (any JSON value)"));
+	}
+
+	FString GraphName = TEXT("EventGraph");
+	Request.Args->TryGetStringField(TEXT("graph_name"), GraphName);
+
+	int32 LoadErrCode = 0;
+	FString LoadErrMsg;
+	UBlueprint* Blueprint = FMCPBlueprintUtils::LoadBlueprintByPath(BlueprintPath, LoadErrCode, LoadErrMsg);
+	if (!Blueprint) { return BGT_MakeError(Request, LoadErrCode, LoadErrMsg); }
+
+	UEdGraph* Graph = BGT_FindGraphByName(Blueprint, GraphName);
+	if (!Graph)
+	{
+		return BGT_MakeError(Request, kMCPErrorGraphNotFound,
+			FString::Printf(TEXT("graph '%s' not found on blueprint '%s'"), *GraphName, *BlueprintPath));
+	}
+
+	UEdGraphNode* Node = BGT_FindNodeByGuid(Graph, NodeGuidStr);
+	if (!Node)
+	{
+		return BGT_MakeError(Request, kMCPErrorNodeNotFound,
+			FString::Printf(TEXT("node '%s' not found in graph '%s'"), *NodeGuidStr, *GraphName));
+	}
+
+	FProperty* Prop = Node->GetClass()->FindPropertyByName(FName(*PropertyName));
+	if (!Prop)
+	{
+		return BGT_MakeError(Request, kMCPErrorPropertyNotFound,
+			FString::Printf(TEXT("property '%s' not found on node class '%s'"),
+				*PropertyName, *Node->GetClass()->GetPathName()));
+	}
+
+	void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(Node);
+
+	// Snapshot prior value via the same reader marshall.read_property uses.
+	TSharedPtr<FJsonValue> PriorValue = FMCPReflection::ReadPropertyValueAt(Prop, ValuePtr);
+
+	// Write through the scoped 4-step contract. FScopedTransaction inside the scope participates
+	// in editor Undo. ``Node`` is both the container (FProperty offset target) AND the owner
+	// (ImportText_Direct outer for text-fallback path resolution).
+	FString WriteError;
+	bool bWriteOk = false;
+	{
+		FMCPWritePropertyScope Scope(Node, Prop, LOCTEXT("MCP_SetNodeProperty", "MCP: bp.set_node_property"));
+		bWriteOk = FMCPReflection::WritePropertyValueAt(Prop, ValuePtr, ValueField, Node, WriteError);
+	}
+	// PostEditChangeProperty has fired on Scope destructor by this point.
+
+	if (!bWriteOk)
+	{
+		return BGT_MakeError(Request, kMCPErrorPropertyTypeMismatch,
+			FString::Printf(TEXT("write rejected on '%s.%s': %s"),
+				*Node->GetClass()->GetName(), *PropertyName, *WriteError));
+	}
+
+	// Re-read AFTER the write so ``new_value`` reflects any schema-side normalisation that
+	// ImportText_Direct may have applied (enum case-folding, numeric clamps, etc.).
+	TSharedPtr<FJsonValue> NewValue = FMCPReflection::ReadPropertyValueAt(Prop, ValuePtr);
+
+	// Refresh pin layout — some K2Node properties (bIsPureFunc, bIsConst, FunctionReference)
+	// change which pins are visible. Cheap no-op for nodes whose pins don't depend on the property.
+	Node->ReconstructNode();
+
+	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetStringField(TEXT("node_guid"),     Node->NodeGuid.ToString(EGuidFormats::Digits));
+	Out->SetStringField(TEXT("node_class"),    Node->GetClass()->GetPathName());
+	Out->SetStringField(TEXT("property_name"), PropertyName);
+	Out->SetField(TEXT("prior_value"), PriorValue.IsValid() ? PriorValue : MakeShared<FJsonValueNull>());
+	Out->SetField(TEXT("new_value"),   NewValue.IsValid()   ? NewValue   : MakeShared<FJsonValueNull>());
+	return BGT_MakeSuccessObj(Request, Out);
+}
+
+// ─── bp.set_pin_default ────────────────────────────────────────────────────────────────────────
+//
+// Args:    { blueprint_path, graph_name?, node_guid, pin_name, value: <JSON> }
+// Result:  { node_guid, pin_name, prior_default, new_default }
+//
+// Refuses pins with LinkedTo.Num() > 0 (a connected pin uses the linked value, not the default).
+// Object pins (PC_Object/PC_Class) with a string-shaped ``value`` route through
+// ``UEdGraphSchema_K2::TrySetDefaultObject`` (LoadObject path). All other pin shapes route through
+// ``UEdGraphSchema_K2::TrySetDefaultValue`` — the schema's string-parsing entry point that handles
+// primitives, enums, structs, soft refs, and emits an FFormatNamedArguments diagnostic on failure
+// via ``IsPinDefaultValid``.
+//
+// Numeric / boolean JSON values are stringified for the schema (it parses everything from FString).
+//
+// Errors: -32050 GraphNotFound, -32051 NodeNotFound, -32052 PinNotFound,
+//         -32602 InvalidParams (pin is connected), -32006 PropertyTypeMismatch (schema rejected),
+//         -32027 PIEActive.
+FMCPResponse Tool_SetPinDefault(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (FMCPWorldContext::IsPIEActive())
+	{
+		return BGT_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+	}
+
+	FString BlueprintPath, NodeGuidStr, PinName;
+	FMCPResponse Err;
+	if (!BGT_RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
+	if (!BGT_RequireStringField(Request, TEXT("node_guid"),      NodeGuidStr,   Err)) { return Err; }
+	if (!BGT_RequireStringField(Request, TEXT("pin_name"),       PinName,       Err)) { return Err; }
+
+	const TSharedPtr<FJsonValue> ValueField = Request.Args->TryGetField(TEXT("value"));
+	if (!ValueField.IsValid())
+	{
+		return BGT_MakeError(Request, kBGTErrorInvalidParams,
+			TEXT("missing required field 'value' (string / number / bool / null for default reset)"));
+	}
+
+	FString GraphName = TEXT("EventGraph");
+	Request.Args->TryGetStringField(TEXT("graph_name"), GraphName);
+
+	int32 LoadErrCode = 0;
+	FString LoadErrMsg;
+	UBlueprint* Blueprint = FMCPBlueprintUtils::LoadBlueprintByPath(BlueprintPath, LoadErrCode, LoadErrMsg);
+	if (!Blueprint) { return BGT_MakeError(Request, LoadErrCode, LoadErrMsg); }
+
+	UEdGraph* Graph = BGT_FindGraphByName(Blueprint, GraphName);
+	if (!Graph)
+	{
+		return BGT_MakeError(Request, kMCPErrorGraphNotFound,
+			FString::Printf(TEXT("graph '%s' not found on blueprint '%s'"), *GraphName, *BlueprintPath));
+	}
+
+	UEdGraphNode* Node = BGT_FindNodeByGuid(Graph, NodeGuidStr);
+	if (!Node)
+	{
+		return BGT_MakeError(Request, kMCPErrorNodeNotFound,
+			FString::Printf(TEXT("node '%s' not found in graph '%s'"), *NodeGuidStr, *GraphName));
+	}
+
+	UEdGraphPin* Pin = Node->FindPin(FName(*PinName));
+	if (!Pin)
+	{
+		return BGT_MakeError(Request, kMCPErrorPinNotFound,
+			FString::Printf(TEXT("pin '%s' not found on node '%s' (class %s)"),
+				*PinName, *Node->GetNodeTitle(ENodeTitleType::ListView).ToString(),
+				*Node->GetClass()->GetName()));
+	}
+
+	if (Pin->LinkedTo.Num() > 0)
+	{
+		return BGT_MakeError(Request, kBGTErrorInvalidParams,
+			FString::Printf(TEXT("pin '%s' is connected to %d link(s); disconnect first via "
+				"bp.disconnect_pin or bp.connect_pins (break-others response)"),
+				*PinName, Pin->LinkedTo.Num()));
+	}
+
+	const UEdGraphSchema_K2* Schema = Cast<UEdGraphSchema_K2>(Pin->GetSchema());
+	if (!Schema)
+	{
+		return BGT_MakeError(Request, kBGTErrorInternal,
+			FString::Printf(TEXT("pin '%s' schema is not UEdGraphSchema_K2 (class=%s)"),
+				*PinName, *Pin->GetSchema()->GetClass()->GetPathName()));
+	}
+
+	// Snapshot prior default for the response BEFORE schema modifies it.
+	TSharedRef<FJsonObject> PriorDefault = BGT_BuildPinDefaultSnapshot(Pin);
+
+	FScopedTransaction Transaction(LOCTEXT("MCP_SetPinDefault", "MCP: bp.set_pin_default"));
+	Blueprint->Modify();
+	Graph->Modify();
+	Node->Modify();
+
+	// Coerce JSON value to FString for the schema. Distinguish object-ref shape (PC_Object/PC_Class
+	// + string-shaped value) so we can use TrySetDefaultObject (LoadObject). Otherwise route through
+	// TrySetDefaultValue — the schema's universal string parser.
+	const bool bIsHardObjectCategory =
+		Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Object ||
+		Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Class;
+	FString ValueAsString;
+	bool bWroteAsObject = false;
+
+	// Null value → reset to autogenerated default.
+	if (ValueField->Type == EJson::Null)
+	{
+		ValueAsString = Pin->AutogeneratedDefaultValue;
+	}
+	else if (ValueField->Type == EJson::String)
+	{
+		ValueAsString = ValueField->AsString();
+	}
+	else if (ValueField->Type == EJson::Number)
+	{
+		ValueAsString = FString::SanitizeFloat(ValueField->AsNumber());
+	}
+	else if (ValueField->Type == EJson::Boolean)
+	{
+		ValueAsString = ValueField->AsBool() ? TEXT("true") : TEXT("false");
+	}
+	else
+	{
+		return BGT_MakeError(Request, kMCPErrorPropertyTypeMismatch,
+			FString::Printf(TEXT("unsupported JSON value type for pin '%s' default — "
+				"expected string/number/bool/null, got JSON type %d"), *PinName,
+				static_cast<int32>(ValueField->Type)));
+	}
+
+	// Hard object pin path: load the UObject by string path then bind via TrySetDefaultObject.
+	// TrySetDefaultObject does NOT also exist for SoftObject / SoftClass — those use the path
+	// string straight through TrySetDefaultValue (which serialises the FSoftObjectPath internally).
+	if (bIsHardObjectCategory && ValueField->Type == EJson::String && !ValueAsString.IsEmpty())
+	{
+		UObject* TargetObject = LoadObject<UObject>(nullptr, *ValueAsString);
+		if (!TargetObject)
+		{
+			return BGT_MakeError(Request, kMCPErrorObjectNotFound,
+				FString::Printf(TEXT("could not resolve object path '%s' for pin '%s' (PC_Object/PC_Class default)"),
+					*ValueAsString, *PinName));
+		}
+		Schema->TrySetDefaultObject(*Pin, TargetObject, /*bMarkAsModified=*/ true);
+		bWroteAsObject = true;
+	}
+	else
+	{
+		Schema->TrySetDefaultValue(*Pin, ValueAsString, /*bMarkAsModified=*/ true);
+	}
+
+	// Schema's TrySetDefault* validates internally via IsPinDefaultValid; on validation failure it
+	// silently leaves the pin's DefaultValue/DefaultObject unchanged. Detect this by comparing
+	// before/after — if neither slot changed, surface as PropertyTypeMismatch with the input.
+	TSharedRef<FJsonObject> NewDefault = BGT_BuildPinDefaultSnapshot(Pin);
+	{
+		const FString PriorValStr  = PriorDefault->GetStringField(TEXT("default_value"));
+		const FString NewValStr    = NewDefault->GetStringField(TEXT("default_value"));
+		const FString PriorObjStr  = PriorDefault->HasTypedField<EJson::String>(TEXT("default_object"))
+			? PriorDefault->GetStringField(TEXT("default_object")) : FString();
+		const FString NewObjStr    = NewDefault->HasTypedField<EJson::String>(TEXT("default_object"))
+			? NewDefault->GetStringField(TEXT("default_object")) : FString();
+		// Surface mismatch ONLY when caller actually supplied something other than the prior — a
+		// no-op (e.g. setting the existing value again) is a successful write.
+		const bool bDidChange = PriorValStr != NewValStr || PriorObjStr != NewObjStr;
+		const bool bDesiredChange = !ValueAsString.IsEmpty() &&
+			(bWroteAsObject ? PriorObjStr != ValueAsString : PriorValStr != ValueAsString);
+		if (bDesiredChange && !bDidChange)
+		{
+			return BGT_MakeError(Request, kMCPErrorPropertyTypeMismatch,
+				FString::Printf(TEXT("schema rejected default '%s' for pin '%s' (category=%s) — "
+					"value does not satisfy IsPinDefaultValid"),
+					*ValueAsString, *PinName, *Pin->PinType.PinCategory.ToString()));
+		}
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetStringField(TEXT("node_guid"), Node->NodeGuid.ToString(EGuidFormats::Digits));
+	Out->SetStringField(TEXT("pin_name"),  PinName);
+	Out->SetObjectField(TEXT("prior_default"), PriorDefault);
+	Out->SetObjectField(TEXT("new_default"),   NewDefault);
+	return BGT_MakeSuccessObj(Request, Out);
+}
+
+// ─── bp.delete_node ────────────────────────────────────────────────────────────────────────────
+//
+// Args:    { blueprint_path, graph_name?, node_guid }
+// Result:  { deleted: bool, node_class, links_broken: int }
+//
+// Refuses K2Node_FunctionEntry / K2Node_FunctionResult / K2Node_Event (excluding K2Node_CustomEvent
+// — user-created events are deletable). Defense-in-depth ``CanUserDeleteNode()`` guard catches
+// any future engine-blessed undeletable subclass (Composites, Tunnels, etc.). ``Graph->RemoveNode``
+// auto-breaks all linked pins; ``links_broken`` is the count summed across all pins BEFORE removal.
+//
+// Errors: -32050 GraphNotFound, -32051 NodeNotFound, -32602 InvalidParams (entry/result/event),
+//         -32027 PIEActive.
+FMCPResponse Tool_DeleteNode(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (FMCPWorldContext::IsPIEActive())
+	{
+		return BGT_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+	}
+
+	FString BlueprintPath, NodeGuidStr;
+	FMCPResponse Err;
+	if (!BGT_RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
+	if (!BGT_RequireStringField(Request, TEXT("node_guid"),      NodeGuidStr,   Err)) { return Err; }
+
+	FString GraphName = TEXT("EventGraph");
+	Request.Args->TryGetStringField(TEXT("graph_name"), GraphName);
+
+	int32 LoadErrCode = 0;
+	FString LoadErrMsg;
+	UBlueprint* Blueprint = FMCPBlueprintUtils::LoadBlueprintByPath(BlueprintPath, LoadErrCode, LoadErrMsg);
+	if (!Blueprint) { return BGT_MakeError(Request, LoadErrCode, LoadErrMsg); }
+
+	UEdGraph* Graph = BGT_FindGraphByName(Blueprint, GraphName);
+	if (!Graph)
+	{
+		return BGT_MakeError(Request, kMCPErrorGraphNotFound,
+			FString::Printf(TEXT("graph '%s' not found on blueprint '%s'"), *GraphName, *BlueprintPath));
+	}
+
+	UEdGraphNode* Node = BGT_FindNodeByGuid(Graph, NodeGuidStr);
+	if (!Node)
+	{
+		return BGT_MakeError(Request, kMCPErrorNodeNotFound,
+			FString::Printf(TEXT("node '%s' not found in graph '%s'"), *NodeGuidStr, *GraphName));
+	}
+
+	// Refuse entry/result/event terminators per Wave F1 brief. K2Node_CustomEvent is a subclass of
+	// K2Node_Event but represents a user-created event — DELETABLE. The Cast<UK2Node_CustomEvent>
+	// exclusion is what differentiates the two cases at this layer.
+	const bool bIsFunctionEntry  = Node->IsA<UK2Node_FunctionEntry>();
+	const bool bIsFunctionResult = Node->IsA<UK2Node_FunctionResult>();
+	const bool bIsBuiltinEvent   = Node->IsA<UK2Node_Event>() && !Node->IsA<UK2Node_CustomEvent>();
+	if (bIsFunctionEntry || bIsFunctionResult || bIsBuiltinEvent)
+	{
+		const TCHAR* WhichKind = bIsFunctionEntry  ? TEXT("FunctionEntry")
+			                   : bIsFunctionResult ? TEXT("FunctionResult")
+			                                       : TEXT("Event");
+		return BGT_MakeError(Request, kBGTErrorInvalidParams,
+			FString::Printf(TEXT("cannot delete %s node '%s' (class=%s) — entry/result/builtin-event "
+				"nodes anchor the graph and are undeletable; remove the graph itself via bp.remove_function "
+				"or unbind via the editor"),
+				WhichKind, *NodeGuidStr, *Node->GetClass()->GetName()));
+	}
+
+	// Defense-in-depth — catches K2Node_Tunnel / K2Node_Composite / future undeletables.
+	if (!Node->CanUserDeleteNode())
+	{
+		return BGT_MakeError(Request, kBGTErrorInvalidParams,
+			FString::Printf(TEXT("node class '%s' reports CanUserDeleteNode=false; engine refuses deletion"),
+				*Node->GetClass()->GetName()));
+	}
+
+	// Count links across all pins so the caller can compare against subsequent connect_pins ops.
+	int32 LinksToBreak = 0;
+	for (const UEdGraphPin* Pin : Node->Pins)
+	{
+		if (Pin) { LinksToBreak += Pin->LinkedTo.Num(); }
+	}
+
+	const FString NodeClassPath = Node->GetClass()->GetPathName();
+	const FString NodeTitle     = Node->GetNodeTitle(ENodeTitleType::ListView).ToString();
+
+	FScopedTransaction Transaction(LOCTEXT("MCP_DeleteBPNode", "MCP: bp.delete_node"));
+	Blueprint->Modify();
+	Graph->Modify();
+	Node->Modify();
+
+	// RemoveNode internally calls Pin->BreakAllPinLinks() on every pin then drops the node from
+	// Graph->Nodes. Pass bBreakAllLinks=true (default) explicitly for clarity.
+	Graph->RemoveNode(Node);
+
+	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetBoolField(TEXT("deleted"),         true);
+	Out->SetStringField(TEXT("node_class"),    NodeClassPath);
+	Out->SetStringField(TEXT("node_title"),    NodeTitle);
+	Out->SetNumberField(TEXT("links_broken"),  static_cast<double>(LinksToBreak));
+	return BGT_MakeSuccessObj(Request, Out);
+}
+
+// ─── bp.disconnect_pin ─────────────────────────────────────────────────────────────────────────
+//
+// Args:    { blueprint_path, graph_name?, node_guid, pin_name }
+// Result:  { pin_name, links_broken: int }
+//
+// Calls ``Pin->BreakAllPinLinks(true)`` — the ``true`` arg tells UE to notify connected pins'
+// nodes via ``PinConnectionListChanged`` so they can react (e.g. K2 wildcards collapsing back
+// to ``Wildcard`` category after losing their type-inducing connection).
+//
+// Errors: -32050 GraphNotFound, -32051 NodeNotFound, -32052 PinNotFound, -32027 PIEActive.
+FMCPResponse Tool_DisconnectPin(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (FMCPWorldContext::IsPIEActive())
+	{
+		return BGT_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+	}
+
+	FString BlueprintPath, NodeGuidStr, PinName;
+	FMCPResponse Err;
+	if (!BGT_RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
+	if (!BGT_RequireStringField(Request, TEXT("node_guid"),      NodeGuidStr,   Err)) { return Err; }
+	if (!BGT_RequireStringField(Request, TEXT("pin_name"),       PinName,       Err)) { return Err; }
+
+	FString GraphName = TEXT("EventGraph");
+	Request.Args->TryGetStringField(TEXT("graph_name"), GraphName);
+
+	int32 LoadErrCode = 0;
+	FString LoadErrMsg;
+	UBlueprint* Blueprint = FMCPBlueprintUtils::LoadBlueprintByPath(BlueprintPath, LoadErrCode, LoadErrMsg);
+	if (!Blueprint) { return BGT_MakeError(Request, LoadErrCode, LoadErrMsg); }
+
+	UEdGraph* Graph = BGT_FindGraphByName(Blueprint, GraphName);
+	if (!Graph)
+	{
+		return BGT_MakeError(Request, kMCPErrorGraphNotFound,
+			FString::Printf(TEXT("graph '%s' not found on blueprint '%s'"), *GraphName, *BlueprintPath));
+	}
+
+	UEdGraphNode* Node = BGT_FindNodeByGuid(Graph, NodeGuidStr);
+	if (!Node)
+	{
+		return BGT_MakeError(Request, kMCPErrorNodeNotFound,
+			FString::Printf(TEXT("node '%s' not found in graph '%s'"), *NodeGuidStr, *GraphName));
+	}
+
+	UEdGraphPin* Pin = Node->FindPin(FName(*PinName));
+	if (!Pin)
+	{
+		return BGT_MakeError(Request, kMCPErrorPinNotFound,
+			FString::Printf(TEXT("pin '%s' not found on node '%s'"),
+				*PinName, *Node->GetNodeTitle(ENodeTitleType::ListView).ToString()));
+	}
+
+	const int32 PriorLinks = Pin->LinkedTo.Num();
+
+	if (PriorLinks == 0)
+	{
+		// No-op succeeds — caller may be in an idempotent disconnect loop. Return links_broken=0
+		// rather than erroring so the caller's iteration completes cleanly.
+		TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+		Out->SetStringField(TEXT("pin_name"), PinName);
+		Out->SetNumberField(TEXT("links_broken"), 0.0);
+		return BGT_MakeSuccessObj(Request, Out);
+	}
+
+	FScopedTransaction Transaction(LOCTEXT("MCP_DisconnectPin", "MCP: bp.disconnect_pin"));
+	Blueprint->Modify();
+	Graph->Modify();
+	Node->Modify();
+	// Also Modify() all linked-to nodes so the transaction captures their pin state too — needed
+	// for clean Undo.
+	for (UEdGraphPin* LinkedPin : Pin->LinkedTo)
+	{
+		if (LinkedPin && LinkedPin->GetOwningNode()) { LinkedPin->GetOwningNode()->Modify(); }
+	}
+
+	Pin->BreakAllPinLinks(/*bNotifyNodes=*/ true);
+
+	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetStringField(TEXT("pin_name"), PinName);
+	Out->SetNumberField(TEXT("links_broken"), static_cast<double>(PriorLinks));
+	return BGT_MakeSuccessObj(Request, Out);
+}
+
+// ─── bp.move_node ──────────────────────────────────────────────────────────────────────────────
+//
+// Args:    { blueprint_path, graph_name?, node_guid, position: [x, y] }
+// Result:  { node_guid, prior_position: [x, y], new_position: [x, y] }
+//
+// Pure cosmetic mutation — NodePosX / NodePosY are graph editor layout coords (int32, no unit).
+// FScopedTransaction still wraps the change so Ctrl-Z reverts the move alongside any other
+// transactions of the same session. Bypasses ``Node->ReconstructNode`` (position doesn't affect
+// pin layout) for speed.
+//
+// Errors: -32050 GraphNotFound, -32051 NodeNotFound, -32602 InvalidParams (missing position),
+//         -32027 PIEActive.
+FMCPResponse Tool_MoveNode(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (FMCPWorldContext::IsPIEActive())
+	{
+		return BGT_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+	}
+
+	FString BlueprintPath, NodeGuidStr;
+	FMCPResponse Err;
+	if (!BGT_RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
+	if (!BGT_RequireStringField(Request, TEXT("node_guid"),      NodeGuidStr,   Err)) { return Err; }
+
+	const TArray<TSharedPtr<FJsonValue>>* PositionArr = nullptr;
+	if (!Request.Args->TryGetArrayField(TEXT("position"), PositionArr) || !PositionArr || PositionArr->Num() != 2)
+	{
+		return BGT_MakeError(Request, kBGTErrorInvalidParams,
+			TEXT("missing/invalid 'position' field — expected [x, y] number array of length 2"));
+	}
+
+	FString GraphName = TEXT("EventGraph");
+	Request.Args->TryGetStringField(TEXT("graph_name"), GraphName);
+
+	int32 LoadErrCode = 0;
+	FString LoadErrMsg;
+	UBlueprint* Blueprint = FMCPBlueprintUtils::LoadBlueprintByPath(BlueprintPath, LoadErrCode, LoadErrMsg);
+	if (!Blueprint) { return BGT_MakeError(Request, LoadErrCode, LoadErrMsg); }
+
+	UEdGraph* Graph = BGT_FindGraphByName(Blueprint, GraphName);
+	if (!Graph)
+	{
+		return BGT_MakeError(Request, kMCPErrorGraphNotFound,
+			FString::Printf(TEXT("graph '%s' not found on blueprint '%s'"), *GraphName, *BlueprintPath));
+	}
+
+	UEdGraphNode* Node = BGT_FindNodeByGuid(Graph, NodeGuidStr);
+	if (!Node)
+	{
+		return BGT_MakeError(Request, kMCPErrorNodeNotFound,
+			FString::Printf(TEXT("node '%s' not found in graph '%s'"), *NodeGuidStr, *GraphName));
+	}
+
+	const int32 PriorX = Node->NodePosX;
+	const int32 PriorY = Node->NodePosY;
+	const int32 NewX = static_cast<int32>((*PositionArr)[0]->AsNumber());
+	const int32 NewY = static_cast<int32>((*PositionArr)[1]->AsNumber());
+
+	{
+		FScopedTransaction Transaction(LOCTEXT("MCP_MoveBPNode", "MCP: bp.move_node"));
+		Blueprint->Modify();
+		Graph->Modify();
+		Node->Modify();
+
+		Node->NodePosX = NewX;
+		Node->NodePosY = NewY;
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+
+	TArray<TSharedPtr<FJsonValue>> PriorPosArr;
+	PriorPosArr.Add(MakeShared<FJsonValueNumber>(PriorX));
+	PriorPosArr.Add(MakeShared<FJsonValueNumber>(PriorY));
+
+	TArray<TSharedPtr<FJsonValue>> NewPosArr;
+	NewPosArr.Add(MakeShared<FJsonValueNumber>(NewX));
+	NewPosArr.Add(MakeShared<FJsonValueNumber>(NewY));
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetStringField(TEXT("node_guid"), Node->NodeGuid.ToString(EGuidFormats::Digits));
+	Out->SetArrayField(TEXT("prior_position"), PriorPosArr);
+	Out->SetArrayField(TEXT("new_position"),   NewPosArr);
+	return BGT_MakeSuccessObj(Request, Out);
+}
+
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)
 {
@@ -447,11 +1045,20 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 		OutRegisteredMethodNames.Add(MethodName);
 	};
 
-	RegisterTool(TEXT("bp.add_node"),     &Tool_AddNode,     /*Lane A*/ false);
-	RegisterTool(TEXT("bp.connect_pins"), &Tool_ConnectPins, /*Lane A*/ false);
+	RegisterTool(TEXT("bp.add_node"),          &Tool_AddNode,          /*Lane A*/ false);
+	RegisterTool(TEXT("bp.connect_pins"),      &Tool_ConnectPins,      /*Lane A*/ false);
+
+	// Wave F Surface 1 — graph CRUD.
+	RegisterTool(TEXT("bp.set_node_property"), &Tool_SetNodeProperty,  /*Lane A*/ false);
+	RegisterTool(TEXT("bp.set_pin_default"),   &Tool_SetPinDefault,    /*Lane A*/ false);
+	RegisterTool(TEXT("bp.delete_node"),       &Tool_DeleteNode,       /*Lane A*/ false);
+	RegisterTool(TEXT("bp.disconnect_pin"),    &Tool_DisconnectPin,    /*Lane A*/ false);
+	RegisterTool(TEXT("bp.move_node"),         &Tool_MoveNode,         /*Lane A*/ false);
 
 	UE_LOG(LogMCP, Log,
-		TEXT("BP graph surface registered: bp.add_node + bp.connect_pins (Wave B Tier 4, Lane A)"));
+		TEXT("BP graph surface registered: bp.add_node + bp.connect_pins (Wave B Tier 4) + "
+		     "bp.set_node_property + bp.set_pin_default + bp.delete_node + bp.disconnect_pin + "
+		     "bp.move_node (Wave F1) — all Lane A"));
 }
 
 } // namespace FBlueprintGraphTools
