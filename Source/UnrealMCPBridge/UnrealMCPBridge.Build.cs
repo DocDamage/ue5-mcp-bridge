@@ -121,6 +121,11 @@ public class UnrealMCPBridge : ModuleRules
 				// UGameplayTagsManager + FGameplayTag + FGameplayTagContainer + IGameplayTagAssetInterface
 				// live in the Runtime/GameplayTags module.
 				"GameplayTags",
+				// Wave E Surface 5 2026-05 — Enhanced Input introspection surface.
+				// UInputMappingContext + UInputAction + FEnhancedActionKeyMapping + UInputModifier +
+				// UInputTrigger + UEnhancedInputLocalPlayerSubsystem all live in EnhancedInput
+				// (runtime module, plugin loaded by default in UE 5.7).
+				"EnhancedInput",
 			}
 		);
 

@@ -27,6 +27,7 @@
 #include "Tools/FolderTools.h"
 #include "Tools/GameplayTagTools.h"
 #include "Tools/HierarchyTools.h"
+#include "Tools/InputTools.h"
 #include "Tools/LevelCompositeTools.h"
 #include "Tools/LevelStreamingTools.h"
 #include "Tools/LevelTools.h"
@@ -525,6 +526,27 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// Reads bypass PIE guard; mutators refuse PIE with -32027. No new error codes — reuses
 	// -32004 / -32010 / -32011 / -32014 / -32027 / -32602 / -32603.
 	FTextureTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Wave E Surface 5 2026-05: Enhanced Input introspection surface (4 tools, all Lane A,
+	// all read-only - no PIE guard, no transactions, no MarkPackageDirty).
+	//   input.list_mapping_contexts  - paginated UInputMappingContext asset enumeration
+	//                                   (FARFilter + FMCPPageCursor; mirror of mesh.list shape).
+	//   input.list_input_actions     - paginated UInputAction asset enumeration.
+	//   input.get_context_bindings   - walks UIMC->GetMappings() and reports per-mapping
+	//                                   action_path + key + modifier-class list + trigger-class
+	//                                   list. Default-key-mappings only (profile overrides not
+	//                                   enumerated - callers use marshall.read_property for those).
+	//   input.list_player_contexts   - enumerates active mapping contexts on a player
+	//                                   controller's UEnhancedInputLocalPlayerSubsystem. In UE 5.7
+	//                                   UEnhancedPlayerInput::AppliedInputContextData is
+	//                                   protected, so this probes HasMappingContext against every
+	//                                   loaded UInputMappingContext asset. Returns ``hint`` field
+	//                                   to disambiguate states. Skips unloaded IMC assets (the
+	//                                   subsystem only holds strong refs to loaded IMCs).
+	// Reuses existing error codes - no new codes introduced: -32004 / -32010 / -32011 / -32015 /
+	// -32602. Reads PIE-safe (no guard). Build.cs adds ``EnhancedInput`` private dep (runtime
+	// module from the EnhancedInput plugin, default-enabled in UE 5.7).
+	FInputTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	// Phase 6 Chunk E: Live Coding surface (1 async composite — livecoding.recompile, Python
 	// wrapper in phase6_composites.py). Backing internal handler livecoding._recompile_internal
