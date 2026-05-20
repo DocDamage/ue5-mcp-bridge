@@ -3060,6 +3060,431 @@ FMCPResponse Tool_ListInterfaces(const FMCPRequest& Request)
 	return BP_MakeSuccessObj(Request, Out);
 }
 
+// ─── Wave F Surface 5 — Blueprint variable metadata + category enumeration (2 tools) ─────────
+//
+// ``bp.set_variable_metadata`` flips property-flag bits + writes named ``FBPVariableMetaDataEntry``
+// entries on ``Blueprint->NewVariables[i]``. We use ``FBlueprintEditorUtils`` helpers wherever they
+// exist (Category, raw MetaData kv) and fall back to direct ``PropertyFlags |= / &= ~`` toggles for
+// the bits that lack a dedicated setter (CPF_Edit / CPF_DisableEditOnInstance / CPF_BlueprintReadOnly
+// / CPF_Net / CPF_RepNotify / CPF_SaveGame / CPF_Transient / CPF_ExposeOnSpawn).
+//
+// ``bp.list_categories`` is a pure read that walks both NewVariables and FunctionGraphs to compose
+// the distinct sorted category set.
+
+namespace
+{
+	/**
+	 * Build a JSON snapshot of one variable's current metadata, used to populate the prior/new
+	 * pair in the bp.set_variable_metadata response. Mirrors the ``BP_BuildVariableSummary``
+	 * field set but trimmed to just the metadata bits — pin_type and default_value are out of
+	 * scope (the caller's bp.get_variable still produces those).
+	 *
+	 * Shape:
+	 *   {
+	 *     "category":            "Stats" | "",
+	 *     "tooltip":             "Tooltip text" | "",
+	 *     "edit_anywhere":       bool (CPF_Edit set),
+	 *     "blueprint_readable":  bool (CPF_BlueprintReadOnly inverted),
+	 *     "blueprint_writable":  bool (CPF_BlueprintReadOnly absent),
+	 *     "instance_editable":   bool (CPF_DisableEditOnInstance absent),
+	 *     "expose_on_spawn":     bool (CPF_ExposeOnSpawn OR meta ExposeOnSpawn=true),
+	 *     "replicate":           "none" | "replicated" | "rep_notify",
+	 *     "rep_notify_function": "FName" | "",
+	 *     "save_game":           bool (CPF_SaveGame),
+	 *     "transient":           bool (CPF_Transient)
+	 *   }
+	 */
+	TSharedPtr<FJsonObject> BP_BuildVariableMetadataSnapshot(const FBPVariableDescription& Var)
+	{
+		TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
+		Obj->SetStringField(TEXT("category"), Var.Category.ToString());
+
+		// Tooltip / ExposeOnSpawn live in MetaDataArray. We follow BP_BuildVariableSummary's
+		// case-insensitive comparison since Epic sometimes serialises with mixed case.
+		FString Tooltip;
+		bool bExposeOnSpawnMeta = false;
+		const FName MD_Tooltip(TEXT("Tooltip"));
+		const FName MD_ExposeOnSpawn(TEXT("ExposeOnSpawn"));
+		for (const FBPVariableMetaDataEntry& Meta : Var.MetaDataArray)
+		{
+			if (Meta.DataKey == MD_Tooltip)
+			{
+				Tooltip = Meta.DataValue;
+			}
+			else if (Meta.DataKey == MD_ExposeOnSpawn)
+			{
+				bExposeOnSpawnMeta = Meta.DataValue.Equals(TEXT("true"), ESearchCase::IgnoreCase);
+			}
+		}
+		Obj->SetStringField(TEXT("tooltip"), Tooltip);
+
+		const uint64 Flags = Var.PropertyFlags;
+		// edit_anywhere — exposed in editor (Details panel) iff CPF_Edit is set. UE's variable
+		// detail panel toggle "Instance Editable" controls CPF_DisableEditOnInstance separately;
+		// edit_anywhere here = "the property is editable in any context".
+		Obj->SetBoolField(TEXT("edit_anywhere"), (Flags & CPF_Edit) != 0);
+		// blueprint_readable / blueprint_writable are derived from CPF_BlueprintReadOnly + the
+		// presence of the variable on a BP at all (we know it's present — it's the one we just
+		// looked up). Readable is ALWAYS true for BP vars; writable iff CPF_BlueprintReadOnly absent.
+		Obj->SetBoolField(TEXT("blueprint_readable"), true);
+		Obj->SetBoolField(TEXT("blueprint_writable"), (Flags & CPF_BlueprintReadOnly) == 0);
+		Obj->SetBoolField(TEXT("instance_editable"), (Flags & CPF_DisableEditOnInstance) == 0);
+
+		const bool bExposeOnSpawnFlag = (Flags & CPF_ExposeOnSpawn) != 0;
+		Obj->SetBoolField(TEXT("expose_on_spawn"), bExposeOnSpawnFlag || bExposeOnSpawnMeta);
+
+		const bool bIsNet = (Flags & CPF_Net) != 0;
+		const bool bIsRepNotify = (Flags & CPF_RepNotify) != 0;
+		const TCHAR* RepStr = TEXT("none");
+		if (bIsRepNotify) { RepStr = TEXT("rep_notify"); }
+		else if (bIsNet)  { RepStr = TEXT("replicated"); }
+		Obj->SetStringField(TEXT("replicate"), RepStr);
+		Obj->SetStringField(TEXT("rep_notify_function"), Var.RepNotifyFunc.IsNone() ? FString() : Var.RepNotifyFunc.ToString());
+
+		Obj->SetBoolField(TEXT("save_game"), (Flags & CPF_SaveGame) != 0);
+		Obj->SetBoolField(TEXT("transient"), (Flags & CPF_Transient) != 0);
+		return Obj;
+	}
+
+	/**
+	 * Apply a property-flag bit on FBPVariableDescription. ``bSet`` true → bitwise OR; false →
+	 * bitwise AND-complement. Centralised so the set/clear branches don't sprawl through the
+	 * tool body.
+	 */
+	void BP_ApplyVariablePropertyFlag(FBPVariableDescription& Var, uint64 Flag, bool bSet)
+	{
+		if (bSet) { Var.PropertyFlags |= Flag; }
+		else      { Var.PropertyFlags &= ~Flag; }
+	}
+} // namespace
+
+// ─── bp.set_variable_metadata (Lane A, PIE-guarded) ──────────────────────────────────────────
+//
+// Mutates the per-variable metadata + property-flag bits. EVERY field in args.metadata is OPTIONAL
+// — only the keys present in the supplied object are written. Returns a {prior, new} snapshot pair
+// so callers can revert via a follow-up set_variable_metadata call.
+//
+// Field mapping:
+//   category            → FBPVariableDescription::Category (via SetBlueprintVariableCategory)
+//   tooltip             → MetaDataArray["Tooltip"] (via SetBlueprintVariableMetaData)
+//   edit_anywhere       → CPF_Edit bit + clears CPF_DisableEditOnInstance when enabling
+//   blueprint_readable  → reserved (currently informational — BP vars are always BP-readable)
+//   blueprint_writable  → CPF_BlueprintReadOnly bit (writable=true clears it, false sets it)
+//   instance_editable   → CPF_DisableEditOnInstance bit (instance_editable=true CLEARS it)
+//   expose_on_spawn     → CPF_ExposeOnSpawn bit AND MetaDataArray["ExposeOnSpawn"] (engine sets
+//                         both depending on path; we sync them)
+//   replicate           → "none" / "replicated" / "rep_notify" — manages CPF_Net + CPF_RepNotify
+//   rep_notify_function → FBPVariableDescription::RepNotifyFunc (only meaningful when replicate
+//                         is "rep_notify"; ignored otherwise)
+//   save_game           → CPF_SaveGame bit
+//   transient           → CPF_Transient bit
+//
+// Args:    { blueprint_path: string, variable_name: string,
+//            metadata: { category?, tooltip?, edit_anywhere?, blueprint_readable?,
+//                        blueprint_writable?, instance_editable?, expose_on_spawn?,
+//                        replicate?: "none"|"replicated"|"rep_notify",
+//                        rep_notify_function?, save_game?, transient? } }
+// Result:  { prior: {...}, new: {...} }
+//
+// Errors:
+//   -32027 PIEActive
+//   -32010 / -32004 / -32031 (resolve)
+//   -32602 InvalidParams       — missing variable_name OR missing 'metadata' object OR
+//                                unknown 'replicate' value (must be one of three keywords)
+//   -32037 VariableNotFound    — name not present in NewVariables[]
+FMCPResponse Tool_SetVariableMetadata(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (BP_IsPIEActive()) { return BP_MakePIEError(Request); }
+
+	FString Path;
+	FMCPResponse PathErr;
+	if (!BP_RequireBlueprintPath(Request, Path, PathErr)) { return PathErr; }
+
+	FString VarNameStr;
+	if (!Request.Args->TryGetStringField(TEXT("variable_name"), VarNameStr) || VarNameStr.IsEmpty())
+	{
+		return BP_MakeError(Request, kBPErrorInvalidParams,
+			TEXT("missing required string field 'variable_name'"));
+	}
+
+	const TSharedPtr<FJsonObject>* MetadataObjPtr = nullptr;
+	if (!Request.Args->TryGetObjectField(TEXT("metadata"), MetadataObjPtr) || !MetadataObjPtr || !MetadataObjPtr->IsValid())
+	{
+		return BP_MakeError(Request, kBPErrorInvalidParams,
+			TEXT("missing required object field 'metadata'"));
+	}
+	const TSharedPtr<FJsonObject>& Metadata = *MetadataObjPtr;
+
+	FMCPResponse ResolveErr;
+	UBlueprint* Blueprint = BP_ResolveBlueprintOrError(Request, Path, ResolveErr);
+	if (!Blueprint) { return ResolveErr; }
+
+	const FName VarName(*VarNameStr);
+	const int32 Idx = FMCPBlueprintUtils::FindVariableIndex(Blueprint, VarName);
+	if (Idx == INDEX_NONE)
+	{
+		return BP_MakeError(Request, kMCPErrorVariableNotFound,
+			FString::Printf(TEXT("variable '%s' not found on blueprint '%s'"),
+				*VarNameStr, *Path));
+	}
+
+	// Validate replicate field up-front so we fail before any mutation is applied.
+	enum class EReplicateMode : uint8 { Unset, None, Replicated, RepNotify };
+	EReplicateMode ReplicateMode = EReplicateMode::Unset;
+	FString ReplicateStr;
+	if (Metadata->TryGetStringField(TEXT("replicate"), ReplicateStr))
+	{
+		if      (ReplicateStr.Equals(TEXT("none"),       ESearchCase::IgnoreCase)) { ReplicateMode = EReplicateMode::None; }
+		else if (ReplicateStr.Equals(TEXT("replicated"), ESearchCase::IgnoreCase)) { ReplicateMode = EReplicateMode::Replicated; }
+		else if (ReplicateStr.Equals(TEXT("rep_notify"), ESearchCase::IgnoreCase)) { ReplicateMode = EReplicateMode::RepNotify; }
+		else
+		{
+			return BP_MakeError(Request, kBPErrorInvalidParams,
+				FString::Printf(
+					TEXT("metadata.replicate must be 'none'|'replicated'|'rep_notify', got '%s'"),
+					*ReplicateStr));
+		}
+	}
+
+	// Snapshot prior BEFORE any mutation so the response carries the rollback state.
+	TSharedPtr<FJsonObject> PriorSnap = BP_BuildVariableMetadataSnapshot(Blueprint->NewVariables[Idx]);
+
+	const FScopedTransaction Transaction(LOCTEXT("BPSetVariableMetadata", "MCP: set variable metadata"));
+
+	// ─── Category (uses canonical helper which also handles recompile flag) ──────────────────
+	FString CategoryStr;
+	if (Metadata->TryGetStringField(TEXT("category"), CategoryStr))
+	{
+		FBlueprintEditorUtils::SetBlueprintVariableCategory(
+			Blueprint, VarName, /*InScope*/ nullptr,
+			FText::FromString(CategoryStr));
+	}
+
+	// ─── Tooltip (uses canonical helper) ─────────────────────────────────────────────────────
+	FString TooltipStr;
+	if (Metadata->TryGetStringField(TEXT("tooltip"), TooltipStr))
+	{
+		if (TooltipStr.IsEmpty())
+		{
+			// Clear-side: the canonical helper has no "remove" path for an empty value; use the
+			// explicit RemoveBlueprintVariableMetaData helper so the kv entry drops entirely.
+			FBlueprintEditorUtils::RemoveBlueprintVariableMetaData(
+				Blueprint, VarName, /*InScope*/ nullptr, FName(TEXT("Tooltip")));
+		}
+		else
+		{
+			FBlueprintEditorUtils::SetBlueprintVariableMetaData(
+				Blueprint, VarName, /*InScope*/ nullptr, FName(TEXT("Tooltip")), TooltipStr);
+		}
+	}
+
+	// ─── Property-flag bits — direct manipulation ────────────────────────────────────────────
+	// NB: All mutators that flip flags must Modify() the BP first so undo captures the prior
+	// state. We've already entered FScopedTransaction; Modify() registers this BP's prior PropertyFlags.
+	FBPVariableDescription& Var = Blueprint->NewVariables[Idx];
+	bool bAnyFlagChanged = false;
+
+	bool bEditAnywhere = false;
+	if (Metadata->TryGetBoolField(TEXT("edit_anywhere"), bEditAnywhere))
+	{
+		// edit_anywhere=true → exposes the property in BOTH archetype editor AND placed instances:
+		// we set CPF_Edit and CLEAR CPF_DisableEditOnInstance simultaneously. Setting it to false
+		// just clears CPF_Edit (caller can independently re-enable instance_editable).
+		Blueprint->Modify();
+		BP_ApplyVariablePropertyFlag(Var, CPF_Edit, bEditAnywhere);
+		if (bEditAnywhere)
+		{
+			BP_ApplyVariablePropertyFlag(Var, CPF_DisableEditOnInstance, false);
+		}
+		bAnyFlagChanged = true;
+	}
+
+	bool bBPWritable = false;
+	if (Metadata->TryGetBoolField(TEXT("blueprint_writable"), bBPWritable))
+	{
+		Blueprint->Modify();
+		// blueprint_writable=true → clear CPF_BlueprintReadOnly. =false → set it.
+		BP_ApplyVariablePropertyFlag(Var, CPF_BlueprintReadOnly, !bBPWritable);
+		bAnyFlagChanged = true;
+	}
+
+	// blueprint_readable is currently informational only — BP variables are always BP-readable in
+	// UE (the flag controlling read access is just "is it on the class"). We accept the field
+	// silently for forward-compat (would map to a future BlueprintHiddenAccessSpecifier).
+	bool bBPReadableScratch = false;
+	(void)Metadata->TryGetBoolField(TEXT("blueprint_readable"), bBPReadableScratch);
+
+	bool bInstanceEditable = false;
+	if (Metadata->TryGetBoolField(TEXT("instance_editable"), bInstanceEditable))
+	{
+		Blueprint->Modify();
+		// instance_editable=true CLEARS CPF_DisableEditOnInstance.
+		BP_ApplyVariablePropertyFlag(Var, CPF_DisableEditOnInstance, !bInstanceEditable);
+		bAnyFlagChanged = true;
+	}
+
+	bool bExposeOnSpawn = false;
+	if (Metadata->TryGetBoolField(TEXT("expose_on_spawn"), bExposeOnSpawn))
+	{
+		Blueprint->Modify();
+		BP_ApplyVariablePropertyFlag(Var, CPF_ExposeOnSpawn, bExposeOnSpawn);
+		// Engine also stores ExposeOnSpawn in MetaData for one of two reasons: legacy serialisation
+		// path or BP variable detail panel UX. Sync both so reads via BP_BuildVariableSummary +
+		// BP_BuildVariableMetadataSnapshot return consistent state regardless of which path the
+		// engine queries.
+		if (bExposeOnSpawn)
+		{
+			FBlueprintEditorUtils::SetBlueprintVariableMetaData(
+				Blueprint, VarName, /*InScope*/ nullptr, FName(TEXT("ExposeOnSpawn")), TEXT("true"));
+		}
+		else
+		{
+			FBlueprintEditorUtils::RemoveBlueprintVariableMetaData(
+				Blueprint, VarName, /*InScope*/ nullptr, FName(TEXT("ExposeOnSpawn")));
+		}
+		bAnyFlagChanged = true;
+	}
+
+	if (ReplicateMode != EReplicateMode::Unset)
+	{
+		Blueprint->Modify();
+		// Manage CPF_Net + CPF_RepNotify pair atomically. rep_notify_function is read once and
+		// only honoured when ReplicateMode=RepNotify (matches engine UX — the field is greyed out
+		// for the other two modes in the BP variable detail panel).
+		switch (ReplicateMode)
+		{
+		case EReplicateMode::None:
+			BP_ApplyVariablePropertyFlag(Var, CPF_Net,        false);
+			BP_ApplyVariablePropertyFlag(Var, CPF_RepNotify,  false);
+			Var.RepNotifyFunc = NAME_None;
+			break;
+		case EReplicateMode::Replicated:
+			BP_ApplyVariablePropertyFlag(Var, CPF_Net,        true);
+			BP_ApplyVariablePropertyFlag(Var, CPF_RepNotify,  false);
+			Var.RepNotifyFunc = NAME_None;
+			break;
+		case EReplicateMode::RepNotify:
+		{
+			BP_ApplyVariablePropertyFlag(Var, CPF_Net,        true);
+			BP_ApplyVariablePropertyFlag(Var, CPF_RepNotify,  true);
+			FString RepNotifyFuncStr;
+			if (Metadata->TryGetStringField(TEXT("rep_notify_function"), RepNotifyFuncStr)
+				&& !RepNotifyFuncStr.IsEmpty())
+			{
+				Var.RepNotifyFunc = FName(*RepNotifyFuncStr);
+			}
+			break;
+		}
+		default:
+			break;
+		}
+		bAnyFlagChanged = true;
+	}
+	else
+	{
+		// replicate field absent but rep_notify_function may still be supplied (rare — caller is
+		// just updating the function name without changing the mode). Honour it iff CPF_RepNotify
+		// already set.
+		FString RepNotifyFuncStr;
+		if (Metadata->TryGetStringField(TEXT("rep_notify_function"), RepNotifyFuncStr))
+		{
+			Blueprint->Modify();
+			Var.RepNotifyFunc = RepNotifyFuncStr.IsEmpty() ? NAME_None : FName(*RepNotifyFuncStr);
+			bAnyFlagChanged = true;
+		}
+	}
+
+	bool bSaveGame = false;
+	if (Metadata->TryGetBoolField(TEXT("save_game"), bSaveGame))
+	{
+		Blueprint->Modify();
+		BP_ApplyVariablePropertyFlag(Var, CPF_SaveGame, bSaveGame);
+		bAnyFlagChanged = true;
+	}
+	bool bTransient = false;
+	if (Metadata->TryGetBoolField(TEXT("transient"), bTransient))
+	{
+		Blueprint->Modify();
+		BP_ApplyVariablePropertyFlag(Var, CPF_Transient, bTransient);
+		bAnyFlagChanged = true;
+	}
+
+	// MarkBlueprintAsStructurallyModified: the canonical helpers above (Category / MetaData) already
+	// dirty the BP via internal MarkBlueprintAsModified calls, but property-flag flips do NOT pass
+	// through any helper that schedules recompile. Flag changes alter the generated UClass shape
+	// (CPF_Net flips REPNOTIFY codegen, CPF_RepNotify flips OnRep_* lookups, etc.) — these REQUIRE
+	// skeleton recompile to materialise on the GeneratedClass.
+	if (bAnyFlagChanged)
+	{
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+	}
+
+	TSharedPtr<FJsonObject> NewSnap = BP_BuildVariableMetadataSnapshot(Blueprint->NewVariables[Idx]);
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetObjectField(TEXT("prior"), PriorSnap);
+	Out->SetObjectField(TEXT("new"), NewSnap);
+	return BP_MakeSuccessObj(Request, Out);
+}
+
+// ─── bp.list_categories (Lane A, no PIE guard, READ) ─────────────────────────────────────────
+//
+// Enumerate distinct category names across:
+//   - Blueprint->NewVariables[i].Category (FText.ToString)
+//   - Each function graph's FKismetUserDeclaredFunctionMetadata::Category (via GetGraphFunctionMetaData)
+//
+// Empty / unset categories are SKIPPED — they'd otherwise pollute the set with "" entries that
+// have no surface meaning. Result is deterministically sorted (TSet.Array().Sort()).
+//
+// Args:    { blueprint_path: string }
+// Result:  { categories: [string] }
+//
+// Errors:
+//   -32010 / -32004 / -32031 (resolve)
+FMCPResponse Tool_ListCategories(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	FString Path;
+	FMCPResponse PathErr;
+	if (!BP_RequireBlueprintPath(Request, Path, PathErr)) { return PathErr; }
+
+	FMCPResponse ResolveErr;
+	UBlueprint* Blueprint = BP_ResolveBlueprintOrError(Request, Path, ResolveErr);
+	if (!Blueprint) { return ResolveErr; }
+
+	TSet<FString> Categories;
+	Categories.Reserve(Blueprint->NewVariables.Num() + Blueprint->FunctionGraphs.Num());
+
+	for (const FBPVariableDescription& Var : Blueprint->NewVariables)
+	{
+		const FString Cat = Var.Category.ToString();
+		if (!Cat.IsEmpty())
+		{
+			Categories.Add(Cat);
+		}
+	}
+
+	for (UEdGraph* Graph : Blueprint->FunctionGraphs)
+	{
+		if (!Graph) { continue; }
+		if (FKismetUserDeclaredFunctionMetadata* Meta = FBlueprintEditorUtils::GetGraphFunctionMetaData(Graph))
+		{
+			const FString Cat = Meta->Category.ToString();
+			if (!Cat.IsEmpty())
+			{
+				Categories.Add(Cat);
+			}
+		}
+	}
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetArrayField(TEXT("categories"), BP_StringSetToJsonArray(Categories));
+	return BP_MakeSuccessObj(Request, Out);
+}
+
 // ─── Registration ────────────────────────────────────────────────────────────────────────────
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)
 {
@@ -3120,9 +3545,17 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	RegisterTool(TEXT("bp.remove_interface"), &Tool_RemoveInterface, /*Lane A*/ false);
 	RegisterTool(TEXT("bp.list_interfaces"),  &Tool_ListInterfaces,  /*Lane A*/ false);
 
+	// Wave F Surface 5 — variable-metadata + category enumeration (2 tools, Lane A). set_variable_
+	// metadata is PIE-guarded (manipulates FBPVariableDescription PropertyFlags + MetaDataArray);
+	// list_categories is a pure read with no PIE guard. The two comment-node tools that round out
+	// Surface 5 (bp.add_comment / bp.delete_comment) live in BlueprintGraphTools alongside the
+	// other UEdGraph-node CRUD tools.
+	RegisterTool(TEXT("bp.set_variable_metadata"), &Tool_SetVariableMetadata, /*Lane A*/ false);
+	RegisterTool(TEXT("bp.list_categories"),       &Tool_ListCategories,      /*Lane A*/ false);
+
 	UE_LOG(LogMCP, Log,
-		TEXT("Phase 4 Days 1-10 + bp.create_blueprint + Wave F2 + Wave F4: registered 21 bp.* handlers "
-			 "(6 reads + 6 writes + 1 compile + 1 creator + 4 function-signature + 3 interface, all Lane A); ")
+		TEXT("Phase 4 Days 1-10 + bp.create_blueprint + Wave F2 + Wave F4 + Wave F5: registered 23 bp.* handlers "
+			 "(6 reads + 6 writes + 1 compile + 1 creator + 4 function-signature + 3 interface + 2 variable-metadata, all Lane A); ")
 		TEXT("bp.compile_all_dirty registered separately via FBlueprintCompositeTools"));
 }
 

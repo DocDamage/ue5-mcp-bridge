@@ -132,4 +132,18 @@ namespace FBlueprintTools
 	UNREALMCPBRIDGE_API FMCPResponse Tool_AddInterface(const FMCPRequest& Request);
 	UNREALMCPBRIDGE_API FMCPResponse Tool_RemoveInterface(const FMCPRequest& Request);
 	UNREALMCPBRIDGE_API FMCPResponse Tool_ListInterfaces(const FMCPRequest& Request);
+
+	// ─── Wave F Surface 5 — Blueprint variable metadata + category enumeration (2 tools) ──────
+	//
+	// ``bp.set_variable_metadata`` mutates the property-flag bits + ``FBPVariableMetaDataEntry`` map
+	// on one of ``Blueprint->NewVariables[i]``: Category / Tooltip / EditAnywhere / BlueprintRead* /
+	// InstanceEditable / ExposeOnSpawn / replicate(none|replicated|rep_notify) / RepNotifyFunc /
+	// SaveGame / Transient. PIE-guarded; FScopedTransaction-wrapped. Returns ``{ prior, new }``
+	// snapshot pair so the caller can revert.
+	//
+	// ``bp.list_categories`` walks ``Blueprint->NewVariables[i].Category`` + every function graph's
+	// ``FKismetUserDeclaredFunctionMetadata::Category`` (via ``GetGraphFunctionMetaData``) to produce
+	// a deterministic sorted set of distinct category names. Pure read — no PIE guard.
+	UNREALMCPBRIDGE_API FMCPResponse Tool_SetVariableMetadata(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_ListCategories(const FMCPRequest& Request);
 }

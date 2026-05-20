@@ -100,4 +100,17 @@ namespace FBlueprintGraphTools
 	UNREALMCPBRIDGE_API FMCPResponse Tool_DeleteNode(const FMCPRequest& Request);
 	UNREALMCPBRIDGE_API FMCPResponse Tool_DisconnectPin(const FMCPRequest& Request);
 	UNREALMCPBRIDGE_API FMCPResponse Tool_MoveNode(const FMCPRequest& Request);
+
+	// ─── Wave F Surface 5 — Comment node CRUD (2 tools) ──────────────────────────────────────────
+	//
+	// ``bp.add_comment`` constructs a ``UEdGraphNode_Comment`` (cosmetic box around a region of the
+	// graph), positions + sizes it, sets the user-visible string + color, and inserts it into the
+	// graph. ``bp.delete_comment`` removes a comment by Guid. Both PIE-guarded mutators wrapped in
+	// FScopedTransaction; both Lane A — UEdGraph mutation demands the game thread.
+	//
+	// We co-locate these with the other graph-node tools (vs ``BlueprintTools.cpp``) because they
+	// operate on the same UEdGraph + Guid lookup surface that ``bp.add_node`` / ``bp.delete_node``
+	// already expose — same helpers (``BGT_FindGraphByName`` / ``BGT_FindNodeByGuid``).
+	UNREALMCPBRIDGE_API FMCPResponse Tool_AddComment(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_DeleteComment(const FMCPRequest& Request);
 }

@@ -12,6 +12,7 @@
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraph/EdGraphPin.h"
+#include "EdGraphNode_Comment.h"
 #include "EdGraphSchema_K2.h"
 #include "Engine/Blueprint.h"
 #include "K2Node.h"
@@ -1036,6 +1037,194 @@ FMCPResponse Tool_MoveNode(const FMCPRequest& Request)
 	return BGT_MakeSuccessObj(Request, Out);
 }
 
+// ─── bp.add_comment ────────────────────────────────────────────────────────────────────────────
+//
+// Args:    { blueprint_path: string, graph_name?: string ("EventGraph"),
+//            position: [x, y], size?: [w, h] ([300, 200]), text: string,
+//            color?: [r, g, b, a] ([0.5, 0.5, 0.5, 1.0]) }
+// Result:  { node_guid: string, position: [x, y], size: [w, h], text: string, graph_name: string }
+//
+// Comment nodes are cosmetic boxes that visually group regions of a graph. They live on the same
+// UEdGraph as K2Node subclasses (added via Graph->AddNode) and survive recompiles. Color components
+// MUST be supplied as four floats (RGBA, 0..1 each); failure to pass an array of length 4 falls
+// back to the default mid-grey. NodeWidth / NodeHeight live on the base UEdGraphNode class — they
+// are int32 graph-editor units, no real-world unit.
+//
+// PIE-guarded; FScopedTransaction-wrapped. ``Comment->CreateNewGuid()`` assigns a fresh FGuid which
+// is returned in the response for subsequent deletion via ``bp.delete_comment``.
+//
+// Errors: -32050 GraphNotFound, -32602 InvalidParams (missing position/text), -32027 PIEActive.
+FMCPResponse Tool_AddComment(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (FMCPWorldContext::IsPIEActive())
+	{
+		return BGT_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+	}
+
+	FString BlueprintPath, CommentText;
+	FMCPResponse Err;
+	if (!BGT_RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
+	if (!BGT_RequireStringField(Request, TEXT("text"),           CommentText,   Err)) { return Err; }
+
+	FString GraphName = TEXT("EventGraph");
+	Request.Args->TryGetStringField(TEXT("graph_name"), GraphName);
+
+	// Position: required [x, y] number array.
+	const TArray<TSharedPtr<FJsonValue>>* PositionArr = nullptr;
+	if (!Request.Args->TryGetArrayField(TEXT("position"), PositionArr) || !PositionArr || PositionArr->Num() != 2)
+	{
+		return BGT_MakeError(Request, kBGTErrorInvalidParams,
+			TEXT("missing/invalid 'position' field — expected [x, y] number array of length 2"));
+	}
+	const int32 PosX = static_cast<int32>((*PositionArr)[0]->AsNumber());
+	const int32 PosY = static_cast<int32>((*PositionArr)[1]->AsNumber());
+
+	// Size: optional [w, h]; default [300, 200] matches the BP editor's "Add Comment" hotkey default.
+	int32 SizeW = 300;
+	int32 SizeH = 200;
+	const TArray<TSharedPtr<FJsonValue>>* SizeArr = nullptr;
+	if (Request.Args->TryGetArrayField(TEXT("size"), SizeArr) && SizeArr && SizeArr->Num() == 2)
+	{
+		SizeW = static_cast<int32>((*SizeArr)[0]->AsNumber());
+		SizeH = static_cast<int32>((*SizeArr)[1]->AsNumber());
+	}
+
+	// Color: optional [r, g, b, a] floats. Default mid-grey (matches engine default for new comments).
+	FLinearColor CommentColor(0.5f, 0.5f, 0.5f, 1.0f);
+	const TArray<TSharedPtr<FJsonValue>>* ColorArr = nullptr;
+	if (Request.Args->TryGetArrayField(TEXT("color"), ColorArr) && ColorArr && ColorArr->Num() == 4)
+	{
+		CommentColor.R = static_cast<float>((*ColorArr)[0]->AsNumber());
+		CommentColor.G = static_cast<float>((*ColorArr)[1]->AsNumber());
+		CommentColor.B = static_cast<float>((*ColorArr)[2]->AsNumber());
+		CommentColor.A = static_cast<float>((*ColorArr)[3]->AsNumber());
+	}
+
+	int32 LoadErrCode = 0;
+	FString LoadErrMsg;
+	UBlueprint* Blueprint = FMCPBlueprintUtils::LoadBlueprintByPath(BlueprintPath, LoadErrCode, LoadErrMsg);
+	if (!Blueprint) { return BGT_MakeError(Request, LoadErrCode, LoadErrMsg); }
+
+	UEdGraph* Graph = BGT_FindGraphByName(Blueprint, GraphName);
+	if (!Graph)
+	{
+		return BGT_MakeError(Request, kMCPErrorGraphNotFound,
+			FString::Printf(TEXT("graph '%s' not found on blueprint '%s'"), *GraphName, *BlueprintPath));
+	}
+
+	FScopedTransaction Transaction(LOCTEXT("MCP_AddCommentNode", "MCP: bp.add_comment"));
+	Blueprint->Modify();
+	Graph->Modify();
+
+	UEdGraphNode_Comment* CommentNode = NewObject<UEdGraphNode_Comment>(
+		Graph, NAME_None, RF_Transactional);
+	CommentNode->CreateNewGuid();
+	CommentNode->NodePosX     = PosX;
+	CommentNode->NodePosY     = PosY;
+	CommentNode->NodeWidth    = SizeW;
+	CommentNode->NodeHeight   = SizeH;
+	CommentNode->NodeComment  = CommentText;
+	CommentNode->CommentColor = CommentColor;
+
+	Graph->AddNode(CommentNode, /*bUserAction*/ false, /*bSelectNewNode*/ false);
+	CommentNode->PostPlacedNewNode();
+	// UEdGraphNode_Comment::AllocateDefaultPins is an explicit no-op (header), but we call it to
+	// stay consistent with the K2Node path used by bp.add_node.
+	CommentNode->AllocateDefaultPins();
+
+	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetStringField(TEXT("node_guid"),
+		CommentNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+	Out->SetStringField(TEXT("graph_name"), GraphName);
+	Out->SetStringField(TEXT("text"), CommentText);
+
+	TArray<TSharedPtr<FJsonValue>> PosResp;
+	PosResp.Add(MakeShared<FJsonValueNumber>(PosX));
+	PosResp.Add(MakeShared<FJsonValueNumber>(PosY));
+	Out->SetArrayField(TEXT("position"), PosResp);
+
+	TArray<TSharedPtr<FJsonValue>> SizeResp;
+	SizeResp.Add(MakeShared<FJsonValueNumber>(SizeW));
+	SizeResp.Add(MakeShared<FJsonValueNumber>(SizeH));
+	Out->SetArrayField(TEXT("size"), SizeResp);
+
+	return BGT_MakeSuccessObj(Request, Out);
+}
+
+// ─── bp.delete_comment ─────────────────────────────────────────────────────────────────────────
+//
+// Args:    { blueprint_path: string, graph_name?: string ("EventGraph"), node_guid: string }
+// Result:  { deleted: bool }
+//
+// Looks up the comment node by Guid, validates that it actually IS a UEdGraphNode_Comment (so we
+// don't accidentally let callers use this path to delete K2 nodes — bp.delete_node is the right
+// surface for those), then calls ``Graph->RemoveNode``.
+//
+// Errors: -32050 GraphNotFound, -32051 NodeNotFound (also for "found but not a comment node"),
+//         -32602 InvalidParams (missing node_guid), -32027 PIEActive.
+FMCPResponse Tool_DeleteComment(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (FMCPWorldContext::IsPIEActive())
+	{
+		return BGT_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+	}
+
+	FString BlueprintPath, NodeGuidStr;
+	FMCPResponse Err;
+	if (!BGT_RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
+	if (!BGT_RequireStringField(Request, TEXT("node_guid"),      NodeGuidStr,   Err)) { return Err; }
+
+	FString GraphName = TEXT("EventGraph");
+	Request.Args->TryGetStringField(TEXT("graph_name"), GraphName);
+
+	int32 LoadErrCode = 0;
+	FString LoadErrMsg;
+	UBlueprint* Blueprint = FMCPBlueprintUtils::LoadBlueprintByPath(BlueprintPath, LoadErrCode, LoadErrMsg);
+	if (!Blueprint) { return BGT_MakeError(Request, LoadErrCode, LoadErrMsg); }
+
+	UEdGraph* Graph = BGT_FindGraphByName(Blueprint, GraphName);
+	if (!Graph)
+	{
+		return BGT_MakeError(Request, kMCPErrorGraphNotFound,
+			FString::Printf(TEXT("graph '%s' not found on blueprint '%s'"), *GraphName, *BlueprintPath));
+	}
+
+	UEdGraphNode* Node = BGT_FindNodeByGuid(Graph, NodeGuidStr);
+	if (!Node)
+	{
+		return BGT_MakeError(Request, kMCPErrorNodeNotFound,
+			FString::Printf(TEXT("node '%s' not found in graph '%s'"), *NodeGuidStr, *GraphName));
+	}
+
+	UEdGraphNode_Comment* CommentNode = Cast<UEdGraphNode_Comment>(Node);
+	if (!CommentNode)
+	{
+		return BGT_MakeError(Request, kMCPErrorNodeNotFound,
+			FString::Printf(
+				TEXT("node '%s' in graph '%s' is class '%s', not UEdGraphNode_Comment — use bp.delete_node for K2 nodes"),
+				*NodeGuidStr, *GraphName, *Node->GetClass()->GetName()));
+	}
+
+	FScopedTransaction Transaction(LOCTEXT("MCP_DeleteCommentNode", "MCP: bp.delete_comment"));
+	Blueprint->Modify();
+	Graph->Modify();
+	CommentNode->Modify();
+
+	Graph->RemoveNode(CommentNode);
+
+	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetBoolField(TEXT("deleted"), true);
+	return BGT_MakeSuccessObj(Request, Out);
+}
+
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)
 {
@@ -1055,10 +1244,16 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	RegisterTool(TEXT("bp.disconnect_pin"),    &Tool_DisconnectPin,    /*Lane A*/ false);
 	RegisterTool(TEXT("bp.move_node"),         &Tool_MoveNode,         /*Lane A*/ false);
 
+	// Wave F Surface 5 — comment-node CRUD (paired with bp.set_variable_metadata + bp.list_categories
+	// in BlueprintTools.cpp). Cosmetic graph annotation surface — same UEdGraph mutation pattern as
+	// bp.add_node / bp.delete_node but no pin / type-binding considerations.
+	RegisterTool(TEXT("bp.add_comment"),        &Tool_AddComment,       /*Lane A*/ false);
+	RegisterTool(TEXT("bp.delete_comment"),     &Tool_DeleteComment,    /*Lane A*/ false);
+
 	UE_LOG(LogMCP, Log,
 		TEXT("BP graph surface registered: bp.add_node + bp.connect_pins (Wave B Tier 4) + "
 		     "bp.set_node_property + bp.set_pin_default + bp.delete_node + bp.disconnect_pin + "
-		     "bp.move_node (Wave F1) — all Lane A"));
+		     "bp.move_node (Wave F1) + bp.add_comment + bp.delete_comment (Wave F5) — all Lane A"));
 }
 
 } // namespace FBlueprintGraphTools
