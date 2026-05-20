@@ -137,6 +137,13 @@ public class UnrealMCPBridge : ModuleRules
 				// FPathFindingResult / FNavLocation / FNavPathPoint all live in the NavigationSystem
 				// module (runtime). The plugin is editor-only so this dep is safe.
 				"NavigationSystem",
+				// Wave G Surface 4 2026-05 — Anim Blueprint state machine surface.
+				// UAnimGraphNode_StateMachine / UAnimationStateMachineGraph / UAnimStateNode /
+				// UAnimStateTransitionNode / UAnimStateEntryNode / UAnimGraphNode_StateResult /
+				// UAnimGraphNode_SequencePlayer / UAnimationGraphSchema all live in the AnimGraph
+				// module (editor-only — fine, the plugin is editor-only too). AnimGraphRuntime is
+				// pulled transitively (AnimGraph publicly depends on AnimGraphRuntime).
+				"AnimGraph",
 			}
 		);
 

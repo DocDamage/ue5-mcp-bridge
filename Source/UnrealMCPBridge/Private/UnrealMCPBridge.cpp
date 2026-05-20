@@ -12,6 +12,7 @@
 #include "FMCPServer.h"
 #include "MCPTypes.h"
 #include "Tools/ActorTools.h"
+#include "Tools/AnimBlueprintTools.h"
 #include "Tools/AnimTools.h"
 #include "Tools/AssetCompositeTools.h"
 #include "Tools/AssetRegistryTools.h"
@@ -430,6 +431,32 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	FUMGTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 	FNiagaraTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 	FPhysicsTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Wave G Surface 4 2026-05: Anim Blueprint state machine surface (4 tools, all Lane A).
+	//   animbp.list_state_machines  - walk UAnimBlueprint anim graphs for UAnimGraphNode_StateMachine
+	//                                  instances; reports per-SM name + state_count + sm_node_guid.
+	//                                  Read-only, no PIE guard.
+	//   animbp.get_states           - enumerate UAnimStateNode inside a named state machine; reports
+	//                                  per-state name, position, GUID, is_entry flag, and (when a
+	//                                  SequencePlayer is present in the state's BoundGraph) the
+	//                                  resolved anim_sequence_path. Read-only, no PIE guard.
+	//   animbp.add_state            - NewObject<UAnimStateNode> + PostPlacedNewNode (which auto-
+	//                                  creates BoundGraph + StateResult); rename BoundGraph to the
+	//                                  user-supplied state_name. Optional anim_sequence_path path
+	//                                  spawns a UAnimGraphNode_SequencePlayer inside the state's
+	//                                  anim graph and wires its pose output to the StateResult.
+	//                                  PIE-guarded, FScopedTransaction, MarkBlueprintAsStructurallyModified.
+	//                                  Refuses duplicate state names with -32014 PathInUse.
+	//   animbp.add_transition       - NewObject<UAnimStateTransitionNode> + PostPlacedNewNode (which
+	//                                  auto-creates the boolean-rule UAnimationTransitionGraph) +
+	//                                  CreateConnections to wire pins[0] to from_state output and
+	//                                  pins[1] to to_state input. PIE-guarded, transacted, structural
+	//                                  modify. Refuses from==to with -32602 (self-transitions need
+	//                                  the engine's CreateSelfTransition path).
+	// Reuses existing error codes - no new codes introduced: -32004 / -32010 / -32011 / -32014 /
+	// -32027 / -32031 / -32602 / -32603. Build.cs adds ``AnimGraph`` private dep (editor module —
+	// fine, the plugin is editor-only too).
+	FAnimBlueprintTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	// Wave G Surface 3 2026-05: NavMesh query surface (4 tools, all Lane A).
 	//   navmesh.list                 - enumerate ARecastNavMesh actors + key config fields
