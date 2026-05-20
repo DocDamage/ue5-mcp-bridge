@@ -43,6 +43,7 @@
 #include "Tools/StatsTools.h"
 #include "Tools/TestCompositeTools.h"
 #include "Tools/TestTools.h"
+#include "Tools/TextureTools.h"
 #include "Tools/TransformTools.h"
 #include "Tools/UFunctionTools.h"
 #include "Tools/UMGTools.h"
@@ -510,6 +511,20 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// attach/detach), -32602 (bad rule string, child==parent, snap-as-detach-rule, root component
 	// missing causing AttachToActor refusal).
 	FHierarchyTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Wave E Surface 4 2026-05: UTexture2D inspection + edit surface (4 tools, all Lane A).
+	//   texture.list                  - paginated UTexture2D enumeration (FARFilter + FMCPPageCursor,
+	//                                    mirror of mesh.list).
+	//   texture.get_info              - size [w,h] + pixel_format + compression + mip_count + srgb +
+	//                                    lod_group + lod_bias + never_stream + address_x/y.
+	//   texture.set_compression       - mutate UTexture2D::CompressionSettings + optional
+	//                                    UpdateResource() flush. PIE-guarded, transacted.
+	//   texture.generate_solid_color  - procedural solid-color texture via NewObject<UTexture2D> +
+	//                                    Source.Init(W,H,1,1,TSF_BGRA8). PIE-guarded. PathInUse
+	//                                    covers on-disk + in-memory.
+	// Reads bypass PIE guard; mutators refuse PIE with -32027. No new error codes — reuses
+	// -32004 / -32010 / -32011 / -32014 / -32027 / -32602 / -32603.
+	FTextureTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	// Phase 6 Chunk E: Live Coding surface (1 async composite — livecoding.recompile, Python
 	// wrapper in phase6_composites.py). Backing internal handler livecoding._recompile_internal
