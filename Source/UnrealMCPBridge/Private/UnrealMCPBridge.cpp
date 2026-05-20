@@ -30,6 +30,7 @@
 #include "Tools/LiveCodingTools.h"
 #include "Tools/LogTools.h"
 #include "Tools/MaterialTools.h"
+#include "Tools/MeshTools.h"
 #include "Tools/NiagaraTools.h"
 #include "Tools/PhysicsTools.h"
 #include "Tools/PIETools.h"
@@ -317,6 +318,16 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// trace-world convention). No transactions, no package dirty marking — overlays are
 	// transient line-batcher state, not asset data.
 	FDebugTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Wave D Surface 3 2026-05: UStaticMesh inspection + edit surface (5 tools, all Lane A).
+	//   mesh.list               — paginated UStaticMesh enumeration (FARFilter + FMCPPageCursor)
+	//   mesh.get_info           — bounds + LOD count + material slots + LOD0 vertex/triangle counts
+	//   mesh.list_lods          — per-LOD vertex/triangle counts + screen-size thresholds
+	//   mesh.set_material_slot  — overwrite material at a slot (PIE-guarded, transacted)
+	//   mesh.duplicate          — manual DuplicateObject (no editor pop-up; PIE-guarded)
+	// Reads bypass PIE guard; mutators refuse PIE with -32027. No new error codes — reuses
+	// -32004 / -32010 / -32011 / -32014 / -32026 / -32027 / -32602 / -32603.
+	FMeshTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	// Phase 5 Chunk A: PIE surface (10 tools, all Lane A). Inverse PIE-guard: every pie.* tool
 	// except pie.start and pie.is_running requires PIE to BE running; refuses with -32038
