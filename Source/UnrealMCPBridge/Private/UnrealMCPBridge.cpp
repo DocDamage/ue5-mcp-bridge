@@ -26,6 +26,7 @@
 #include "Tools/EditorTools.h"
 #include "Tools/FolderTools.h"
 #include "Tools/GameplayTagTools.h"
+#include "Tools/HierarchyTools.h"
 #include "Tools/LevelCompositeTools.h"
 #include "Tools/LevelStreamingTools.h"
 #include "Tools/LevelTools.h"
@@ -493,6 +494,22 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// no FScopedTransaction (viewport state isn't on undo stack); no MarkPackageDirty (no
 	// asset state touched).
 	FViewportTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Wave E Surface 3 2026-05: Actor hierarchy / attachment surface (3 tools, all Lane A).
+	//   hierarchy.attach        - AActor::AttachToActor with optional socket + per-axis
+	//                              FAttachmentTransformRules (keep_relative|keep_world|snap) +
+	//                              weld_simulated_bodies. PIE-guarded, transacted, marks child
+	//                              external package dirty.
+	//   hierarchy.detach        - AActor::DetachFromActor with FDetachmentTransformRules
+	//                              (keep_relative|keep_world; snap is rejected — no detach
+	//                              analogue). PIE-guarded, transacted, marks child dirty.
+	//   hierarchy.list_children - AActor::GetAttachedActors (recursive=true walks the whole
+	//                              subtree). Read-only, no PIE guard. Per-child: path, label,
+	//                              attach_socket (omitted when NAME_None).
+	// Reuses existing error codes: -32004 (child or parent missing), -32027 (PIE active for
+	// attach/detach), -32602 (bad rule string, child==parent, snap-as-detach-rule, root component
+	// missing causing AttachToActor refusal).
+	FHierarchyTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	// Phase 6 Chunk E: Live Coding surface (1 async composite — livecoding.recompile, Python
 	// wrapper in phase6_composites.py). Backing internal handler livecoding._recompile_internal
