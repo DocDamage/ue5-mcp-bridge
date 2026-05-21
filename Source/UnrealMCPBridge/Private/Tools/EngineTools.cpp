@@ -77,7 +77,9 @@ namespace FEngineTools
 // No PIE guard, no transactions, no MarkPackageDirty — pure introspection.
 FMCPResponse Tool_GetInfo(const FMCPRequest& Request)
 {
-	check(IsInGameThread());
+	// Lane B safe (Phase 4.2 promote 2026-05-22): FApp::* getters are thread-safe (read from
+	// command-line-derived state set at process init). GIsEditor / IsRunningCommandlet are
+	// init-time constants. GEngine pointer read is safe (set once on init, never reassigned).
 
 	// === UE engine version ===
 	const FEngineVersion& Version = FEngineVersion::Current();
@@ -259,7 +261,8 @@ FMCPResponse Tool_GCCollect(const FMCPRequest& Request)
 // platform-specific allocator stats (Windows: PageFaultCount/PageFile/etc.).
 FMCPResponse Tool_GetMemorySnapshot(const FMCPRequest& Request)
 {
-	check(IsInGameThread());
+	// Lane B safe (Phase 4.2 promote 2026-05-22): FPlatformMemory::{GetStats,GetConstants} +
+	// FApp time getters are documented thread-safe (atomic snapshots).
 
 	const FPlatformMemoryStats Stats = FPlatformMemory::GetStats();
 	const FPlatformMemoryConstants& Constants = FPlatformMemory::GetConstants();
@@ -314,9 +317,12 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 		OutRegisteredMethodNames.Add(MethodName);
 	};
 
-	RegisterTool(TEXT("engine.get_info"),             &Tool_GetInfo,            /*Lane A*/ false);
+	// Phase 4.2 (2026-05-22): get_info + get_memory_snapshot promoted to Lane B (atomic global +
+	// thread-safe FPlatformMemory / FApp reads). gc_collect stays Lane A — GEngine->ForceGarbageCollection
+	// MUST run on game thread (operates on the global UObject heap).
+	RegisterTool(TEXT("engine.get_info"),             &Tool_GetInfo,            /*Lane B*/ true);
 	RegisterTool(TEXT("engine.gc_collect"),           &Tool_GCCollect,          /*Lane A*/ false);
-	RegisterTool(TEXT("engine.get_memory_snapshot"),  &Tool_GetMemorySnapshot,  /*Lane A*/ false);
+	RegisterTool(TEXT("engine.get_memory_snapshot"),  &Tool_GetMemorySnapshot,  /*Lane B*/ true);
 
 	UE_LOG(LogMCP, Log,
 		TEXT("Engine surface registered: 3 tools "

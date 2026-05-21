@@ -27,7 +27,9 @@ namespace FStatsTools
 // ─── stats.get_engine — engine-wide frame/FPS/draw snapshot ─────────────────────────────────
 FMCPResponse Tool_GetEngine(const FMCPRequest& Request)
 {
-	check(IsInGameThread());
+	// Lane B safe (Phase 4.2 promote 2026-05-22): reads only atomic globals (GAverageFPS,
+	// GAverageMS, GFrameCounter, GFrameNumberRenderThread, GIsEditor) + GEngine->bSmoothFrameRate
+	// which is a single bool (read-tear impossible on x86). Worst case = stale-but-valid value.
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetNumberField(TEXT("avg_fps"),        static_cast<double>(GAverageFPS));
@@ -51,7 +53,9 @@ FMCPResponse Tool_GetEngine(const FMCPRequest& Request)
 // ─── stats.get_memory — FPlatformMemory + UE allocator breakdown ────────────────────────────
 FMCPResponse Tool_GetMemory(const FMCPRequest& Request)
 {
-	check(IsInGameThread());
+	// Lane B safe (Phase 4.2 promote 2026-05-22): FPlatformMemory::{GetStats,GetConstants} are
+	// documented thread-safe (atomic snapshot of OS counters). GMalloc->GetDescriptiveName()
+	// returns a const string (FMallocBinned2 etc. expose stable names).
 
 	const FPlatformMemoryStats S = FPlatformMemory::GetStats();
 	const FPlatformMemoryConstants& C = FPlatformMemory::GetConstants();
@@ -92,11 +96,13 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 		OutRegisteredMethodNames.Add(MethodName);
 	};
 
-	RegisterTool(TEXT("stats.get_engine"), &Tool_GetEngine, /*Lane A*/ false);
-	RegisterTool(TEXT("stats.get_memory"), &Tool_GetMemory, /*Lane A*/ false);
+	// Both tools promoted to Lane B in Phase 4.2 (2026-05-22): atomic global reads + thread-safe
+	// FPlatformMemory queries; no UObject access or GEditor/GEngine mutator API touched.
+	RegisterTool(TEXT("stats.get_engine"), &Tool_GetEngine, /*Lane B*/ true);
+	RegisterTool(TEXT("stats.get_memory"), &Tool_GetMemory, /*Lane B*/ true);
 
 	UE_LOG(LogMCP, Log,
-		TEXT("Stats surface registered: stats.get_engine + stats.get_memory (Lane A; editor-context safe)"));
+		TEXT("Stats surface registered: stats.get_engine + stats.get_memory (Lane B; worker-pool safe)"));
 }
 
 } // namespace FStatsTools
