@@ -3,6 +3,7 @@
 #include "AICrowdTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
 #include "Utils/MCPWorldContext.h"
@@ -28,34 +29,13 @@ namespace
 	// AICRWD_ prefix per the unity-build symbol-collision convention. Every Tools/*.cpp anonymous-
 	// namespace helper MUST be uniquely prefixed across the module — see Wave F4 BlueprintComponentTools
 	// rename note in MEMORY.md for the failure mode.
+	//
+	// XX_StampIds / XX_MakeError / XX_MakeSuccessObj removed in Phase 2 — use
+	// FMCPToolHelpers::Xxx from MCPToolHelpers.h. Per-surface error constants kept for now
+	// (Phase 4 sweep target).
 	constexpr int32 kAICRWDErrorInvalidParams   = -32602;
 	constexpr int32 kAICRWDErrorInternal        = -32603;
 	constexpr int32 kAICRWDErrorObjectNotFound  = kMCPErrorObjectNotFound;  // -32004
-
-	void AICRWD_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse AICRWD_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		AICRWD_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse AICRWD_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		AICRWD_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
 
 	// ─── World resolution (PIE-first, editor-fallback) ───────────────────────────────────────────
 
@@ -294,21 +274,21 @@ FMCPResponse Tool_GetSettings(const FMCPRequest& Request)
 	UWorld* World = AICRWD_ResolveWorld();
 	if (!World)
 	{
-		return AICRWD_MakeError(Request, kAICRWDErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kAICRWDErrorInternal,
 			TEXT("no world available (GEditor missing OR no level loaded)"));
 	}
 
 	UNavigationSystemV1* NavSys = UNavigationSystemV1::GetCurrent(World);
 	if (!NavSys)
 	{
-		return AICRWD_MakeError(Request, kAICRWDErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kAICRWDErrorInternal,
 			TEXT("no UNavigationSystemV1 on the resolved world (navigation subsystem disabled?)"));
 	}
 
 	UCrowdManager* CM = UCrowdManager::GetCurrent(World);
 	if (!CM)
 	{
-		return AICRWD_MakeError(Request, kAICRWDErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kAICRWDErrorInternal,
 			TEXT("no UCrowdManager on the navigation subsystem (no NavMeshBoundsVolume in scope, OR "
 				 "the project's NavigationSystem CrowdManagerClass is unset)"));
 	}
@@ -360,7 +340,7 @@ FMCPResponse Tool_GetSettings(const FMCPRequest& Request)
 	{
 		Out->SetNumberField(TEXT("num_sampling_patterns"), IntVal);
 	}
-	return AICRWD_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── ai.crowd.list_agents ──────────────────────────────────────────────────────────────────────
@@ -406,7 +386,7 @@ FMCPResponse Tool_ListAgents(const FMCPRequest& Request)
 	UWorld* World = AICRWD_ResolveWorld();
 	if (!World)
 	{
-		return AICRWD_MakeError(Request, kAICRWDErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kAICRWDErrorInternal,
 			TEXT("no world available (GEditor missing OR no level loaded)"));
 	}
 
@@ -424,7 +404,7 @@ FMCPResponse Tool_ListAgents(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("world"), AICRWD_WorldKindName(World));
 	Out->SetNumberField(TEXT("count"), Arr.Num());
 	Out->SetArrayField(TEXT("agents"), Arr);
-	return AICRWD_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── ai.crowd.set_avoidance_quality ────────────────────────────────────────────────────────────
@@ -463,23 +443,17 @@ FMCPResponse Tool_SetAvoidanceQuality(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (!Request.Args.IsValid())
-	{
-		return AICRWD_MakeError(Request, kAICRWDErrorInvalidParams, TEXT("missing args object"));
-	}
-
 	FString ActorPath;
-	if (!Request.Args->TryGetStringField(TEXT("actor_path"), ActorPath) || ActorPath.IsEmpty())
+	FMCPResponse FieldErr;
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("actor_path"), ActorPath, FieldErr))
 	{
-		return AICRWD_MakeError(Request, kAICRWDErrorInvalidParams,
-			TEXT("missing required string field 'actor_path'"));
+		return FieldErr;
 	}
 
 	FString QualityStr;
-	if (!Request.Args->TryGetStringField(TEXT("quality"), QualityStr) || QualityStr.IsEmpty())
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("quality"), QualityStr, FieldErr))
 	{
-		return AICRWD_MakeError(Request, kAICRWDErrorInvalidParams,
-			TEXT("missing required string field 'quality' (one of \"Low\" / \"Medium\" / \"High\")"));
+		return FieldErr;
 	}
 
 	// Parse quality first (cheap) before the more expensive actor resolution — surfaces bad input
@@ -488,13 +462,13 @@ FMCPResponse Tool_SetAvoidanceQuality(const FMCPRequest& Request)
 	FString ParseErr;
 	if (!AICRWD_ParseQuality(QualityStr, NewQuality, ParseErr))
 	{
-		return AICRWD_MakeError(Request, kAICRWDErrorInvalidParams, ParseErr);
+		return FMCPToolHelpers::MakeError(Request, kAICRWDErrorInvalidParams, ParseErr);
 	}
 
 	UWorld* World = AICRWD_ResolveWorld();
 	if (!World)
 	{
-		return AICRWD_MakeError(Request, kAICRWDErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kAICRWDErrorInternal,
 			TEXT("no world available (GEditor missing OR no level loaded)"));
 	}
 
@@ -502,7 +476,7 @@ FMCPResponse Tool_SetAvoidanceQuality(const FMCPRequest& Request)
 	UCrowdFollowingComponent* Agent = AICRWD_ResolveCrowdFollowingComponent(ActorPath, ResolveErr);
 	if (!Agent)
 	{
-		return AICRWD_MakeError(Request, kAICRWDErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kAICRWDErrorObjectNotFound,
 			FString::Printf(TEXT("actor_path '%s' did not resolve: %s"), *ActorPath, *ResolveErr));
 	}
 
@@ -518,7 +492,7 @@ FMCPResponse Tool_SetAvoidanceQuality(const FMCPRequest& Request)
 		OwnerActor ? FMCPActorPathUtils::BuildActorPath(OwnerActor) : ActorPath);
 	Out->SetStringField(TEXT("prior_quality"), AICRWD_QualityToString(PriorQuality));
 	Out->SetStringField(TEXT("new_quality"),   AICRWD_QualityToString(NewQuality));
-	return AICRWD_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

@@ -3,11 +3,11 @@
 #include "MaterialInstanceTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPAssetLoader.h"
+#include "MCPMutatorScope.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
-#include "Utils/MCPAssetPathUtils.h"
-#include "Utils/MCPMaterialUtils.h"
 #include "Utils/MCPPageCursor.h"
-#include "Utils/MCPWorldContext.h"
 
 #include "AssetRegistry/ARFilter.h"
 #include "AssetRegistry/AssetData.h"
@@ -18,9 +18,6 @@
 #include "Materials/MaterialInstance.h"
 #include "Materials/MaterialInstanceConstant.h"
 #include "Materials/MaterialInterface.h"
-#include "ScopedTransaction.h"
-#include "UObject/Package.h"
-#include "UObject/UObjectGlobals.h"
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -29,106 +26,6 @@
 
 namespace
 {
-	// MI_ prefix per the unity-build symbol-collision convention.
-	constexpr int32 kMIErrorInvalidParams = -32602;
-
-	void MI_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse MI_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		MI_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse MI_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		MI_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
-	bool MI_RequireStringField(const FMCPRequest& Request, const TCHAR* FieldName,
-		FString& OutValue, FMCPResponse& OutError)
-	{
-		if (!Request.Args.IsValid())
-		{
-			OutError = MI_MakeError(Request, kMIErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetStringField(FieldName, OutValue) || OutValue.IsEmpty())
-		{
-			OutError = MI_MakeError(Request, kMIErrorInvalidParams,
-				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
-			return false;
-		}
-		return true;
-	}
-
-	/**
-	 * Load a UMaterialInstanceConstant by path. Returns null on failure with OutErrorCode set to
-	 * one of {-32010 InvalidPath, -32004 ObjectNotFound, -32011 WrongClass}. Mirrors the existing
-	 * FMCPMaterialUtils::LoadMICByPath but uses the bridge's standard error codes (-32011 instead
-	 * of Phase-4-specific -32034 MaterialClassMismatch) per the Wave I S4 brief.
-	 *
-	 * UMaterialInstanceDynamic is also rejected with -32011 — dynamic instances are runtime objects,
-	 * never persisted assets, so a successful LoadObject on a /Game/... path returning one would
-	 * be a degenerate state.
-	 */
-	UMaterialInstanceConstant* MI_LoadMICByPath(const FString& Path, int32& OutErrorCode, FString& OutError)
-	{
-		if (Path.IsEmpty())
-		{
-			OutErrorCode = kMCPErrorInvalidPath;
-			OutError = TEXT("instance_path is empty");
-			return nullptr;
-		}
-		const FString Normalised = FMCPAssetPathUtils::Normalize(Path);
-		if (Normalised.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(Normalised))
-		{
-			OutErrorCode = kMCPErrorInvalidPath;
-			OutError = FString::Printf(
-				TEXT("instance_path '%s' is malformed or references an unknown mount point"),
-				*Path);
-			return nullptr;
-		}
-		UObject* Loaded = LoadObject<UObject>(nullptr, *Normalised);
-		if (!Loaded)
-		{
-			const FString ObjectPath = FMCPAssetPathUtils::ToObjectPath(Normalised);
-			if (!ObjectPath.IsEmpty() && ObjectPath != Normalised)
-			{
-				Loaded = LoadObject<UObject>(nullptr, *ObjectPath);
-			}
-		}
-		if (!Loaded)
-		{
-			OutErrorCode = kMCPErrorObjectNotFound;
-			OutError = FString::Printf(
-				TEXT("instance_path '%s' could not be loaded (no asset found)"), *Path);
-			return nullptr;
-		}
-		UMaterialInstanceConstant* MIC = Cast<UMaterialInstanceConstant>(Loaded);
-		if (!MIC)
-		{
-			OutErrorCode = kMCPErrorWrongClass;
-			OutError = FString::Printf(
-				TEXT("instance_path '%s' is class '%s'; expected UMaterialInstanceConstant"),
-				*Path, *Loaded->GetClass()->GetPathName());
-			return nullptr;
-		}
-		return MIC;
-	}
-
 	/**
 	 * True iff the MIC has a local override entry for the given scalar parameter name. Checks the
 	 * MIC's own ScalarParameterValues array (matches what UE editor shows as "bold/overridden").
@@ -268,12 +165,12 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 		FString DecodeErr;
 		if (!FMCPPageCursorUtils::Decode(PageToken, InCursor, DecodeErr))
 		{
-			return MI_MakeError(Request, kMIErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 				FString::Printf(TEXT("invalid page_token: %s"), *DecodeErr));
 		}
 		if (!FMCPPageCursorUtils::ValidateAgainstFilter(InCursor, FilterHash))
 		{
-			return MI_MakeError(Request, kMCPErrorStaleCursor,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorStaleCursor,
 				TEXT("filter mutated between pages (path_prefix changed); restart pagination"));
 		}
 		while (StartIdx < Assets.Num() &&
@@ -332,7 +229,7 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 		Out->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(OutCursor));
 	}
 
-	return MI_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── mat_inst.get_params ──────────────────────────────────────────────────────────────────────
@@ -356,7 +253,7 @@ FMCPResponse Tool_GetParams(const FMCPRequest& Request)
 
 	FString InstancePath;
 	FMCPResponse Err;
-	if (!MI_RequireStringField(Request, TEXT("instance_path"), InstancePath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("instance_path"), InstancePath, Err)) { return Err; }
 
 	bool bIncludeInherited = false;
 	if (Request.Args.IsValid())
@@ -366,8 +263,8 @@ FMCPResponse Tool_GetParams(const FMCPRequest& Request)
 
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
-	UMaterialInstanceConstant* MIC = MI_LoadMICByPath(InstancePath, LoadErrCode, LoadErrMsg);
-	if (!MIC) { return MI_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	UMaterialInstanceConstant* MIC = FMCPAssetLoader::Load<UMaterialInstanceConstant>(InstancePath, LoadErrCode, LoadErrMsg);
+	if (!MIC) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	// Collect the canonical parameter name set from the parent chain (for include_inherited=true)
 	// OR derive directly from the local override arrays (include_inherited=false).
@@ -447,7 +344,7 @@ FMCPResponse Tool_GetParams(const FMCPRequest& Request)
 	Out->SetArrayField(TEXT("scalar_params"),  ScalarArr);
 	Out->SetArrayField(TEXT("vector_params"),  VectorArr);
 	Out->SetArrayField(TEXT("texture_params"), TextureArr);
-	return MI_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── mat_inst.set_scalar_param ────────────────────────────────────────────────────────────────
@@ -455,8 +352,9 @@ FMCPResponse Tool_GetParams(const FMCPRequest& Request)
 // Args:    { instance_path: string, param_name: string, value: float }
 // Result:  { set: bool, prior_value: float, prior_overridden: bool }
 //
-// PIE-guarded. FScopedTransaction wraps the write; the engine's SetMaterialInstance*ParameterValue
-// internally invokes UpdateMaterialInstance to refresh shaders.
+// PIE-guarded. FMCPMutatorScope wraps the write (PIE-guard + transaction + dirty-flush); the
+// engine's SetMaterialInstance*ParameterValue internally invokes UpdateMaterialInstance to refresh
+// shaders.
 //
 // Param-existence validation: the engine's SetMaterialInstance*ParameterValue does NOT validate
 // the param name against the parent material's parameter set (it just adds to the override array
@@ -473,28 +371,25 @@ FMCPResponse Tool_SetScalarParam(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return MI_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCPMatInstSetScalar", "MCP: set MIC scalar param"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString InstancePath, ParamNameStr;
 	FMCPResponse Err;
-	if (!MI_RequireStringField(Request, TEXT("instance_path"), InstancePath, Err)) { return Err; }
-	if (!MI_RequireStringField(Request, TEXT("param_name"),    ParamNameStr, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("instance_path"), InstancePath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("param_name"),    ParamNameStr, Err)) { return Err; }
 
 	double ValueDouble = 0.0;
-	if (!Request.Args->TryGetNumberField(TEXT("value"), ValueDouble))
+	if (!FMCPToolHelpers::RequireNumberField(Request, TEXT("value"), ValueDouble, Err))
 	{
-		return MI_MakeError(Request, kMIErrorInvalidParams,
-			TEXT("missing required number field 'value'"));
+		return Err;
 	}
 	const float ValueF = static_cast<float>(ValueDouble);
 
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
-	UMaterialInstanceConstant* MIC = MI_LoadMICByPath(InstancePath, LoadErrCode, LoadErrMsg);
-	if (!MIC) { return MI_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	UMaterialInstanceConstant* MIC = FMCPAssetLoader::Load<UMaterialInstanceConstant>(InstancePath, LoadErrCode, LoadErrMsg);
+	if (!MIC) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	const FName ParamName(*ParamNameStr);
 
@@ -503,7 +398,7 @@ FMCPResponse Tool_SetScalarParam(const FMCPRequest& Request)
 	float PriorValue = 0.0f;
 	if (!MIC->GetScalarParameterValue(FHashedMaterialParameterInfo(ParamName), PriorValue))
 	{
-		return MI_MakeError(Request, kMCPErrorPropertyNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyNotFound,
 			FString::Printf(
 				TEXT("scalar parameter '%s' not found on instance '%s' (or its parent material)"),
 				*ParamNameStr, *InstancePath));
@@ -515,19 +410,15 @@ FMCPResponse Tool_SetScalarParam(const FMCPRequest& Request)
 	// We cannot use the return value for validation. Parameter-existence validation is performed
 	// via the prior ``GetScalarParameterValue`` check above. The engine call also internally
 	// invokes ``UpdateMaterialInstance`` — no need to call it again here.
-	{
-		FScopedTransaction Transaction(LOCTEXT("MCPMatInstSetScalar", "MCP: set MIC scalar param"));
-		MIC->Modify();
-		UMaterialEditingLibrary::SetMaterialInstanceScalarParameterValue(MIC, ParamName, ValueF);
-	}
-
-	MIC->GetOutermost()->MarkPackageDirty();
+	MIC->Modify();
+	UMaterialEditingLibrary::SetMaterialInstanceScalarParameterValue(MIC, ParamName, ValueF);
+	Scope.DirtyPackage(MIC->GetOutermost());
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("set"), true);
 	Out->SetNumberField(TEXT("prior_value"), PriorValue);
 	Out->SetBoolField(TEXT("prior_overridden"), bPriorOverridden);
-	return MI_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── mat_inst.set_vector_param ────────────────────────────────────────────────────────────────
@@ -541,40 +432,37 @@ FMCPResponse Tool_SetVectorParam(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return MI_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCPMatInstSetVector", "MCP: set MIC vector param"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString InstancePath, ParamNameStr;
 	FMCPResponse Err;
-	if (!MI_RequireStringField(Request, TEXT("instance_path"), InstancePath, Err)) { return Err; }
-	if (!MI_RequireStringField(Request, TEXT("param_name"),    ParamNameStr, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("instance_path"), InstancePath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("param_name"),    ParamNameStr, Err)) { return Err; }
 
 	const TArray<TSharedPtr<FJsonValue>>* ValueArrPtr = nullptr;
-	if (!Request.Args->TryGetArrayField(TEXT("value"), ValueArrPtr) || !ValueArrPtr)
+	if (!FMCPToolHelpers::RequireArrayField(Request, TEXT("value"), ValueArrPtr, Err))
 	{
-		return MI_MakeError(Request, kMIErrorInvalidParams,
-			TEXT("missing required array field 'value' (expected [r,g,b,a])"));
+		return Err;
 	}
 	FLinearColor Value;
 	FString ReadErr;
 	if (!MI_ReadLinearColorArray(*ValueArrPtr, Value, ReadErr))
 	{
-		return MI_MakeError(Request, kMIErrorInvalidParams, ReadErr);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, ReadErr);
 	}
 
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
-	UMaterialInstanceConstant* MIC = MI_LoadMICByPath(InstancePath, LoadErrCode, LoadErrMsg);
-	if (!MIC) { return MI_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	UMaterialInstanceConstant* MIC = FMCPAssetLoader::Load<UMaterialInstanceConstant>(InstancePath, LoadErrCode, LoadErrMsg);
+	if (!MIC) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	const FName ParamName(*ParamNameStr);
 
 	FLinearColor PriorValue = FLinearColor::Black;
 	if (!MIC->GetVectorParameterValue(FHashedMaterialParameterInfo(ParamName), PriorValue))
 	{
-		return MI_MakeError(Request, kMCPErrorPropertyNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyNotFound,
 			FString::Printf(
 				TEXT("vector parameter '%s' not found on instance '%s' (or its parent material)"),
 				*ParamNameStr, *InstancePath));
@@ -582,19 +470,15 @@ FMCPResponse Tool_SetVectorParam(const FMCPRequest& Request)
 	const bool bPriorOverridden = MI_IsVectorOverridden(MIC, ParamName);
 
 	// See scalar setter for the engine-return-value note.
-	{
-		FScopedTransaction Transaction(LOCTEXT("MCPMatInstSetVector", "MCP: set MIC vector param"));
-		MIC->Modify();
-		UMaterialEditingLibrary::SetMaterialInstanceVectorParameterValue(MIC, ParamName, Value);
-	}
-
-	MIC->GetOutermost()->MarkPackageDirty();
+	MIC->Modify();
+	UMaterialEditingLibrary::SetMaterialInstanceVectorParameterValue(MIC, ParamName, Value);
+	Scope.DirtyPackage(MIC->GetOutermost());
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("set"), true);
 	Out->SetField(TEXT("prior_value"), MI_LinearColorToArray(PriorValue));
 	Out->SetBoolField(TEXT("prior_overridden"), bPriorOverridden);
-	return MI_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── mat_inst.set_texture_param ───────────────────────────────────────────────────────────────
@@ -611,61 +495,31 @@ FMCPResponse Tool_SetTextureParam(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return MI_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCPMatInstSetTexture", "MCP: set MIC texture param"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString InstancePath, ParamNameStr, TexturePathRaw;
 	FMCPResponse Err;
-	if (!MI_RequireStringField(Request, TEXT("instance_path"), InstancePath,    Err)) { return Err; }
-	if (!MI_RequireStringField(Request, TEXT("param_name"),    ParamNameStr,    Err)) { return Err; }
-	if (!MI_RequireStringField(Request, TEXT("texture_path"),  TexturePathRaw,  Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("instance_path"), InstancePath,    Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("param_name"),    ParamNameStr,    Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("texture_path"),  TexturePathRaw,  Err)) { return Err; }
 
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
-	UMaterialInstanceConstant* MIC = MI_LoadMICByPath(InstancePath, LoadErrCode, LoadErrMsg);
-	if (!MIC) { return MI_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	UMaterialInstanceConstant* MIC = FMCPAssetLoader::Load<UMaterialInstanceConstant>(InstancePath, LoadErrCode, LoadErrMsg);
+	if (!MIC) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
-	// Resolve texture asset (mirror of MI_LoadMICByPath shape).
-	const FString TexturePath = FMCPAssetPathUtils::Normalize(TexturePathRaw);
-	if (TexturePath.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(TexturePath))
-	{
-		return MI_MakeError(Request, kMCPErrorInvalidPath,
-			FString::Printf(
-				TEXT("texture_path '%s' is malformed or references an unknown mount point"),
-				*TexturePathRaw));
-	}
-	UObject* LoadedTex = LoadObject<UObject>(nullptr, *TexturePath);
-	if (!LoadedTex)
-	{
-		const FString ObjPath = FMCPAssetPathUtils::ToObjectPath(TexturePath);
-		if (!ObjPath.IsEmpty() && ObjPath != TexturePath)
-		{
-			LoadedTex = LoadObject<UObject>(nullptr, *ObjPath);
-		}
-	}
-	if (!LoadedTex)
-	{
-		return MI_MakeError(Request, kMCPErrorObjectNotFound,
-			FString::Printf(TEXT("texture_path '%s' could not be loaded (no asset found)"),
-				*TexturePathRaw));
-	}
-	UTexture* Texture = Cast<UTexture>(LoadedTex);
-	if (!Texture)
-	{
-		return MI_MakeError(Request, kMCPErrorWrongClass,
-			FString::Printf(
-				TEXT("texture_path '%s' is class '%s'; expected UTexture (Texture2D / TextureCube / etc.)"),
-				*TexturePathRaw, *LoadedTex->GetClass()->GetPathName()));
-	}
+	int32 TexErrCode = 0;
+	FString TexErrMsg;
+	UTexture* Texture = FMCPAssetLoader::Load<UTexture>(TexturePathRaw, TexErrCode, TexErrMsg);
+	if (!Texture) { return FMCPToolHelpers::MakeError(Request, TexErrCode, TexErrMsg); }
 
 	const FName ParamName(*ParamNameStr);
 
 	UTexture* PriorTexture = nullptr;
 	if (!MIC->GetTextureParameterValue(FHashedMaterialParameterInfo(ParamName), PriorTexture))
 	{
-		return MI_MakeError(Request, kMCPErrorPropertyNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyNotFound,
 			FString::Printf(
 				TEXT("texture parameter '%s' not found on instance '%s' (or its parent material)"),
 				*ParamNameStr, *InstancePath));
@@ -673,20 +527,16 @@ FMCPResponse Tool_SetTextureParam(const FMCPRequest& Request)
 	const bool bPriorOverridden = MI_IsTextureOverridden(MIC, ParamName);
 
 	// See scalar setter for the engine-return-value note.
-	{
-		FScopedTransaction Transaction(LOCTEXT("MCPMatInstSetTexture", "MCP: set MIC texture param"));
-		MIC->Modify();
-		UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(MIC, ParamName, Texture);
-	}
-
-	MIC->GetOutermost()->MarkPackageDirty();
+	MIC->Modify();
+	UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(MIC, ParamName, Texture);
+	Scope.DirtyPackage(MIC->GetOutermost());
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("set"), true);
 	Out->SetStringField(TEXT("prior_texture_path"),
 		PriorTexture ? PriorTexture->GetPathName() : FString());
 	Out->SetBoolField(TEXT("prior_overridden"), bPriorOverridden);
-	return MI_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ─────────────────────────────────────────────────────────────────────────────

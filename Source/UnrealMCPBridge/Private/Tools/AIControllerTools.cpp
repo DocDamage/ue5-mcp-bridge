@@ -3,6 +3,7 @@
 #include "AIControllerTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
 
@@ -30,53 +31,10 @@ namespace
 	// AICTRL_ prefix per the unity-build symbol-collision convention. Every Tools/*.cpp anonymous-
 	// namespace helper MUST be uniquely prefixed across the module — see Wave F4 BlueprintComponentTools
 	// rename note in MEMORY.md for the failure mode.
-	constexpr int32 kAICTRLErrorInvalidParams   = -32602;
+	//
+	// Phase 2 (Pair E, Wave J AI sub-2): generic StampIds / MakeError / MakeSuccessObj / RequireString
+	// helpers retired in favour of FMCPToolHelpers::Xxx — only domain-specific resolvers remain.
 	constexpr int32 kAICTRLErrorInternal        = -32603;
-	constexpr int32 kAICTRLErrorObjectNotFound  = kMCPErrorObjectNotFound;  // -32004
-	constexpr int32 kAICTRLErrorInvalidPath     = kMCPErrorInvalidPath;     // -32010
-	constexpr int32 kAICTRLErrorWrongClass      = kMCPErrorWrongClass;      // -32011
-
-	void AICTRL_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse AICTRL_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		AICTRL_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse AICTRL_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		AICTRL_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
-	bool AICTRL_RequireStringField(const FMCPRequest& Request, const TCHAR* FieldName,
-		FString& OutValue, FMCPResponse& OutError)
-	{
-		if (!Request.Args.IsValid())
-		{
-			OutError = AICTRL_MakeError(Request, kAICTRLErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetStringField(FieldName, OutValue) || OutValue.IsEmpty())
-		{
-			OutError = AICTRL_MakeError(Request, kAICTRLErrorInvalidParams,
-				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
-			return false;
-		}
-		return true;
-	}
 
 	/**
 	 * Resolve the editor world for enumeration. Returns null + writes code/message on failure. We
@@ -123,7 +81,7 @@ namespace
 		// Reject backslashes early — matches the IsValidGameOrPlugin gate semantics for asset paths.
 		if (ClassPath.Contains(TEXT("\\")))
 		{
-			OutErrCode = kAICTRLErrorInvalidPath;
+			OutErrCode = kMCPErrorInvalidPath;
 			OutErr = FString::Printf(TEXT("class_filter '%s' contains backslash"), *ClassPath);
 			return nullptr;
 		}
@@ -137,13 +95,13 @@ namespace
 		}
 		if (!Cls)
 		{
-			OutErrCode = kAICTRLErrorObjectNotFound;
+			OutErrCode = kMCPErrorObjectNotFound;
 			OutErr = FString::Printf(TEXT("class_filter '%s' did not resolve to a UClass"), *ClassPath);
 			return nullptr;
 		}
 		if (!Cls->IsChildOf(AAIController::StaticClass()))
 		{
-			OutErrCode = kAICTRLErrorWrongClass;
+			OutErrCode = kMCPErrorWrongClass;
 			OutErr = FString::Printf(
 				TEXT("class_filter '%s' resolves to '%s' which is not derived from AAIController"),
 				*ClassPath, *Cls->GetName());
@@ -162,7 +120,7 @@ namespace
 	{
 		if (ActorPath.IsEmpty())
 		{
-			OutErrCode = kAICTRLErrorInvalidPath;
+			OutErrCode = kMCPErrorInvalidPath;
 			OutErr = TEXT("controller_path is empty");
 			return nullptr;
 		}
@@ -176,13 +134,13 @@ namespace
 		{
 			if (bAmbig)
 			{
-				OutErrCode = kAICTRLErrorObjectNotFound;
+				OutErrCode = kMCPErrorObjectNotFound;
 				OutErr = FString::Printf(
 					TEXT("controller_path '%s' is ambiguous; candidates: %s"),
 					*ActorPath, *AmbigHint);
 				return nullptr;
 			}
-			OutErrCode = kAICTRLErrorObjectNotFound;
+			OutErrCode = kMCPErrorObjectNotFound;
 			OutErr = FString::Printf(
 				TEXT("controller_path '%s' did not resolve: %s"),
 				*ActorPath, *ResolveErr);
@@ -191,7 +149,7 @@ namespace
 		AAIController* AIC = Cast<AAIController>(Actor);
 		if (!AIC)
 		{
-			OutErrCode = kAICTRLErrorWrongClass;
+			OutErrCode = kMCPErrorWrongClass;
 			OutErr = FString::Printf(
 				TEXT("actor '%s' is not an AAIController (got class '%s')"),
 				*ActorPath, *Actor->GetClass()->GetName());
@@ -310,13 +268,13 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 	UWorld* World = AICTRL_ResolveWorld(ErrCode, ErrMsg);
 	if (!World)
 	{
-		return AICTRL_MakeError(Request, ErrCode, ErrMsg);
+		return FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg);
 	}
 
 	UClass* FilterClass = AICTRL_ResolveClassFilter(Request, ErrCode, ErrMsg);
 	if (!FilterClass)
 	{
-		return AICTRL_MakeError(Request, ErrCode, ErrMsg);
+		return FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg);
 	}
 
 	TArray<TSharedPtr<FJsonValue>> ControllersArr;
@@ -330,7 +288,7 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetArrayField(TEXT("controllers"), ControllersArr);
-	return AICTRL_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── ai.controller.get_state ─────────────────────────────────────────────────────────────────────
@@ -375,14 +333,14 @@ FMCPResponse Tool_GetState(const FMCPRequest& Request)
 
 	FString ControllerPath;
 	FMCPResponse Err;
-	if (!AICTRL_RequireStringField(Request, TEXT("controller_path"), ControllerPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("controller_path"), ControllerPath, Err)) { return Err; }
 
 	int32 ErrCode = 0;
 	FString ErrMsg;
 	AAIController* AIC = AICTRL_ResolveController(ControllerPath, ErrCode, ErrMsg);
 	if (!AIC)
 	{
-		return AICTRL_MakeError(Request, ErrCode, ErrMsg);
+		return FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg);
 	}
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
@@ -429,7 +387,7 @@ FMCPResponse Tool_GetState(const FMCPRequest& Request)
 		}
 	}
 
-	return AICTRL_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── ai.controller.respawn_blackboard ────────────────────────────────────────────────────────────
@@ -454,7 +412,9 @@ FMCPResponse Tool_GetState(const FMCPRequest& Request)
 //
 // Notes:
 //   - No PIE guard per the Wave J S3 brief (this is a runtime AI-author workflow — reseating a
-//     blackboard during PIE is the primary use case).
+//     blackboard during PIE is the primary use case). Phase 2 (Pair E) deliberately does NOT
+//     introduce FMCPMutatorScope here for the same reason — adding the scope would PIE-block the
+//     surface, breaking the documented contract.
 //   - Two code paths depending on prior state:
 //       (a) Controller has BlackboardComponent → capture prior asset (if any) → InitializeBlackboard.
 //       (b) Controller has NO BlackboardComponent → AAIController::UseBlackboard creates BOTH
@@ -466,23 +426,23 @@ FMCPResponse Tool_RespawnBlackboard(const FMCPRequest& Request)
 
 	FString ControllerPath;
 	FMCPResponse Err;
-	if (!AICTRL_RequireStringField(Request, TEXT("controller_path"), ControllerPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("controller_path"), ControllerPath, Err)) { return Err; }
 
 	FString BBAssetPath;
-	if (!AICTRL_RequireStringField(Request, TEXT("blackboard_asset_path"), BBAssetPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("blackboard_asset_path"), BBAssetPath, Err)) { return Err; }
 
 	int32 ErrCode = 0;
 	FString ErrMsg;
 	AAIController* AIC = AICTRL_ResolveController(ControllerPath, ErrCode, ErrMsg);
 	if (!AIC)
 	{
-		return AICTRL_MakeError(Request, ErrCode, ErrMsg);
+		return FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg);
 	}
 
 	UBlackboardData* NewBB = LoadObject<UBlackboardData>(nullptr, *BBAssetPath);
 	if (!NewBB)
 	{
-		return AICTRL_MakeError(Request, kAICTRLErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("blackboard_asset_path '%s' did not resolve to a UBlackboardData"),
 				*BBAssetPath));
 	}
@@ -501,7 +461,7 @@ FMCPResponse Tool_RespawnBlackboard(const FMCPRequest& Request)
 		const bool bInit = ExistingBB->InitializeBlackboard(*NewBB);
 		if (!bInit)
 		{
-			return AICTRL_MakeError(Request, kAICTRLErrorInternal,
+			return FMCPToolHelpers::MakeError(Request, kAICTRLErrorInternal,
 				FString::Printf(
 					TEXT("UBlackboardComponent::InitializeBlackboard returned false for asset '%s'"),
 					*BBAssetPath));
@@ -516,7 +476,7 @@ FMCPResponse Tool_RespawnBlackboard(const FMCPRequest& Request)
 		const bool bOk = AIC->UseBlackboard(NewBB, BBOut);
 		if (!bOk || !BBOut)
 		{
-			return AICTRL_MakeError(Request, kAICTRLErrorInternal,
+			return FMCPToolHelpers::MakeError(Request, kAICTRLErrorInternal,
 				FString::Printf(
 					TEXT("AAIController::UseBlackboard returned false for asset '%s'"), *BBAssetPath));
 		}
@@ -524,7 +484,7 @@ FMCPResponse Tool_RespawnBlackboard(const FMCPRequest& Request)
 	}
 
 	Out->SetBoolField(TEXT("replaced"), true);
-	return AICTRL_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ────────────────────────────────────────────────────────────────────────────────

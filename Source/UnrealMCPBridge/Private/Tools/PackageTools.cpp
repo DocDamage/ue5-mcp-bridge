@@ -3,6 +3,7 @@
 #include "PackageTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPAssetPathUtils.h"
 #include "Utils/MCPWorldContext.h"
@@ -27,50 +28,11 @@ namespace
 	// PKG_ prefix per the unity-build symbol-collision convention. The plugin uses unity builds so
 	// anonymous-namespace helpers MUST be uniquely prefixed across every Tools/*.cpp — see the
 	// BlueprintComponentTools rename note in MEMORY.md (Wave F4) for the failure mode.
-	constexpr int32 kPKGErrorInvalidParams = -32602;
-	constexpr int32 kPKGErrorInternal      = -32603;
-
-	void PKG_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse PKG_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		PKG_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse PKG_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		PKG_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
-	bool PKG_RequireStringField(const FMCPRequest& Request, const TCHAR* FieldName,
-		FString& OutValue, FMCPResponse& OutError)
-	{
-		if (!Request.Args.IsValid())
-		{
-			OutError = PKG_MakeError(Request, kPKGErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetStringField(FieldName, OutValue) || OutValue.IsEmpty())
-		{
-			OutError = PKG_MakeError(Request, kPKGErrorInvalidParams,
-				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
-			return false;
-		}
-		return true;
-	}
+	//
+	// XX_StampIds / XX_MakeError / XX_MakeSuccessObj / XX_RequireStringField removed in Phase 2 —
+	// use FMCPToolHelpers::Xxx from MCPToolHelpers.h. Per-surface error constants kept for now
+	// (Phase 4 sweep target).
+	constexpr int32 kPKGErrorInternal = -32603;
 
 	/**
 	 * Normalise the caller's package_path arg and return the canonical package-name form
@@ -81,12 +43,12 @@ namespace
 		FMCPResponse& OutError)
 	{
 		FString Raw;
-		if (!PKG_RequireStringField(Request, TEXT("package_path"), Raw, OutError)) { return false; }
+		if (!FMCPToolHelpers::RequireStringField(Request, TEXT("package_path"), Raw, OutError)) { return false; }
 
 		const FString Normalised = FMCPAssetPathUtils::Normalize(Raw);
 		if (Normalised.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(Normalised))
 		{
-			OutError = PKG_MakeError(Request, kMCPErrorInvalidPath,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 				FString::Printf(TEXT("package_path '%s' malformed or unknown mount"), *Raw));
 			return false;
 		}
@@ -270,7 +232,7 @@ FMCPResponse Tool_Save(const FMCPRequest& Request)
 
 	if (FMCPWorldContext::IsPIEActive())
 	{
-		return PKG_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
 	}
 
 	FString PackageName;
@@ -284,7 +246,7 @@ FMCPResponse Tool_Save(const FMCPRequest& Request)
 	UPackage* Pkg = FindPackage(nullptr, *PackageName);
 	if (!Pkg)
 	{
-		return PKG_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("package '%s' is not loaded — nothing to save"), *PackageName));
 	}
 
@@ -293,7 +255,7 @@ FMCPResponse Tool_Save(const FMCPRequest& Request)
 	// Wave I S1 testing — editor crash with exit code 3 on package.save("/Script/Engine").
 	if (PKG_IsTransientPackage(Pkg))
 	{
-		return PKG_MakeError(Request, kMCPErrorInvalidPath,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 			FString::Printf(TEXT("package '%s' is transient/script (cannot be saved to disk)"),
 				*PackageName));
 	}
@@ -303,7 +265,7 @@ FMCPResponse Tool_Save(const FMCPRequest& Request)
 	const FString Filename = PKG_DeriveFilename(Pkg);
 	if (Filename.IsEmpty())
 	{
-		return PKG_MakeError(Request, kPKGErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kPKGErrorInternal,
 			FString::Printf(TEXT("could not derive on-disk filename for package '%s'"), *PackageName));
 	}
 
@@ -318,7 +280,7 @@ FMCPResponse Tool_Save(const FMCPRequest& Request)
 		// brief named -32015 OperationFailed but the actual MCPTypes.h defines that slot as
 		// StaleCursor (paginator codepath). InternalError + descriptive message is the closer
 		// semantic match for "UE engine API said no" with no further info available.
-		return PKG_MakeError(Request, kPKGErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kPKGErrorInternal,
 			FString::Printf(TEXT("UPackage::SavePackage returned false for '%s' (filename '%s')"),
 				*PackageName, *Filename));
 	}
@@ -328,7 +290,7 @@ FMCPResponse Tool_Save(const FMCPRequest& Request)
 	Out->SetBoolField(TEXT("was_dirty"), bWasDirty);
 	Out->SetStringField(TEXT("file_path"), Filename);
 	Out->SetStringField(TEXT("package_path"), PackageName);
-	return PKG_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── package.save_all ─────────────────────────────────────────────────────────────────────────
@@ -350,7 +312,7 @@ FMCPResponse Tool_SaveAll(const FMCPRequest& Request)
 
 	if (FMCPWorldContext::IsPIEActive())
 	{
-		return PKG_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
 	}
 
 	bool bOnlyDirty = true;
@@ -415,7 +377,7 @@ FMCPResponse Tool_SaveAll(const FMCPRequest& Request)
 	Out->SetNumberField(TEXT("total_candidates"), Candidates.Num());
 	Out->SetBoolField(TEXT("only_dirty"), bOnlyDirty);
 	Out->SetNumberField(TEXT("max_packages"), MaxPackages);
-	return PKG_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── package.list_dirty ───────────────────────────────────────────────────────────────────────
@@ -453,7 +415,7 @@ FMCPResponse Tool_ListDirty(const FMCPRequest& Request)
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetArrayField(TEXT("dirty_packages"), DirtyArr);
 	Out->SetNumberField(TEXT("total_dirty"), TotalDirty);
-	return PKG_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── package.get_dependencies ─────────────────────────────────────────────────────────────────
@@ -511,7 +473,7 @@ FMCPResponse Tool_GetDependencies(const FMCPRequest& Request)
 		FString WalkErr;
 		if (!PKG_WalkDependenciesBFS(IAR, RootName, Category, Query, /*MaxVisited*/ 10000, All, WalkErr))
 		{
-			return PKG_MakeError(Request, kMCPErrorOverlyBroadQuery, WalkErr);
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorOverlyBroadQuery, WalkErr);
 		}
 	}
 	else
@@ -541,7 +503,7 @@ FMCPResponse Tool_GetDependencies(const FMCPRequest& Request)
 	Out->SetNumberField(TEXT("total"), All.Num());
 	Out->SetStringField(TEXT("package_path"), PackageName);
 	Out->SetBoolField(TEXT("recursive"), bRecursive);
-	return PKG_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── package.get_referencers ──────────────────────────────────────────────────────────────────
@@ -605,7 +567,7 @@ FMCPResponse Tool_GetReferencers(const FMCPRequest& Request)
 	Out->SetArrayField(TEXT("referencers"), Items);
 	Out->SetNumberField(TEXT("total"), All.Num());
 	Out->SetStringField(TEXT("package_path"), PackageName);
-	return PKG_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ─────────────────────────────────────────────────────────────────────────────

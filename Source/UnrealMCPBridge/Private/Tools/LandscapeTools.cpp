@@ -3,6 +3,7 @@
 #include "LandscapeTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
 
@@ -25,70 +26,13 @@
 namespace
 {
 	// LAND_ prefix per the unity-build symbol-collision convention.
-	constexpr int32 kLANDErrorInvalidParams   = -32602;
+	// Stamping / require-string / require-number / success / generic-error helpers now live in
+	// FMCPToolHelpers; only domain-specific helpers (vector→JSON, actor-resolution, quad math)
+	// remain here. `kLANDError*` constants kept as local aliases for readability at error sites.
 	constexpr int32 kLANDErrorInternal        = -32603;
 	constexpr int32 kLANDErrorObjectNotFound  = kMCPErrorObjectNotFound;  // -32004
 	constexpr int32 kLANDErrorInvalidPath     = kMCPErrorInvalidPath;     // -32010
 	constexpr int32 kLANDErrorWrongClass      = kMCPErrorWrongClass;      // -32011
-
-	void LAND_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse LAND_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		LAND_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse LAND_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		LAND_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
-	bool LAND_RequireStringField(const FMCPRequest& Request, const TCHAR* FieldName,
-		FString& OutValue, FMCPResponse& OutError)
-	{
-		if (!Request.Args.IsValid())
-		{
-			OutError = LAND_MakeError(Request, kLANDErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetStringField(FieldName, OutValue) || OutValue.IsEmpty())
-		{
-			OutError = LAND_MakeError(Request, kLANDErrorInvalidParams,
-				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
-			return false;
-		}
-		return true;
-	}
-
-	bool LAND_RequireNumberField(const FMCPRequest& Request, const TCHAR* FieldName,
-		double& OutValue, FMCPResponse& OutError)
-	{
-		if (!Request.Args.IsValid())
-		{
-			OutError = LAND_MakeError(Request, kLANDErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetNumberField(FieldName, OutValue))
-		{
-			OutError = LAND_MakeError(Request, kLANDErrorInvalidParams,
-				FString::Printf(TEXT("missing required number field '%s'"), FieldName));
-			return false;
-		}
-		return true;
-	}
 
 	/** Convert FVector → JSON [x,y,z] array. Mirrors NavMeshTools shape. */
 	TArray<TSharedPtr<FJsonValue>> LAND_VectorToArray(const FVector& V)
@@ -221,13 +165,13 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 
 	if (!GEditor)
 	{
-		return LAND_MakeError(Request, kLANDErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kLANDErrorInternal,
 			TEXT("no GEditor available (commandlet / cooked build)"));
 	}
 	UWorld* World = GEditor->GetEditorWorldContext().World();
 	if (!World)
 	{
-		return LAND_MakeError(Request, kLANDErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kLANDErrorInternal,
 			TEXT("no editor world available (no map loaded)"));
 	}
 
@@ -255,7 +199,7 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetArrayField(TEXT("landscapes"), LandscapesArr);
-	return LAND_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── landscape.get_info ──────────────────────────────────────────────────────────────────────────
@@ -294,17 +238,17 @@ FMCPResponse Tool_GetInfo(const FMCPRequest& Request)
 
 	FString LandscapePath;
 	FMCPResponse Err;
-	if (!LAND_RequireStringField(Request, TEXT("landscape_path"), LandscapePath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("landscape_path"), LandscapePath, Err)) { return Err; }
 
 	int32 ResolveErrCode = 0;
 	FString ResolveErr;
 	ALandscape* LS = LAND_ResolveLandscape(LandscapePath, ResolveErrCode, ResolveErr);
-	if (!LS) { return LAND_MakeError(Request, ResolveErrCode, ResolveErr); }
+	if (!LS) { return FMCPToolHelpers::MakeError(Request, ResolveErrCode, ResolveErr); }
 
 	ULandscapeInfo* LSI = LS->GetLandscapeInfo();
 	if (!LSI)
 	{
-		return LAND_MakeError(Request, kLANDErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kLANDErrorInternal,
 			FString::Printf(
 				TEXT("landscape '%s' has no ULandscapeInfo (un-registered or mid-load proxy)"),
 				*LandscapePath));
@@ -337,7 +281,7 @@ FMCPResponse Tool_GetInfo(const FMCPRequest& Request)
 	Out->SetNumberField(TEXT("min_z"),                MinZ);
 	Out->SetNumberField(TEXT("max_z"),                MaxZ);
 	Out->SetNumberField(TEXT("total_components"),     static_cast<double>(LS->LandscapeComponents.Num()));
-	return LAND_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── landscape.get_height_at ─────────────────────────────────────────────────────────────────────
@@ -375,21 +319,21 @@ FMCPResponse Tool_GetHeightAt(const FMCPRequest& Request)
 
 	FString LandscapePath;
 	FMCPResponse Err;
-	if (!LAND_RequireStringField(Request, TEXT("landscape_path"), LandscapePath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("landscape_path"), LandscapePath, Err)) { return Err; }
 
 	double WorldX = 0.0, WorldY = 0.0;
-	if (!LAND_RequireNumberField(Request, TEXT("world_x"), WorldX, Err)) { return Err; }
-	if (!LAND_RequireNumberField(Request, TEXT("world_y"), WorldY, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireNumberField(Request, TEXT("world_x"), WorldX, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireNumberField(Request, TEXT("world_y"), WorldY, Err)) { return Err; }
 
 	int32 ResolveErrCode = 0;
 	FString ResolveErr;
 	ALandscape* LS = LAND_ResolveLandscape(LandscapePath, ResolveErrCode, ResolveErr);
-	if (!LS) { return LAND_MakeError(Request, ResolveErrCode, ResolveErr); }
+	if (!LS) { return FMCPToolHelpers::MakeError(Request, ResolveErrCode, ResolveErr); }
 
 	ULandscapeInfo* LSI = LS->GetLandscapeInfo();
 	if (!LSI)
 	{
-		return LAND_MakeError(Request, kLANDErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kLANDErrorInternal,
 			FString::Printf(
 				TEXT("landscape '%s' has no ULandscapeInfo (un-registered or mid-load proxy)"),
 				*LandscapePath));
@@ -407,7 +351,7 @@ FMCPResponse Tool_GetHeightAt(const FMCPRequest& Request)
 	{
 		Out->SetNumberField(TEXT("height_z"), 0.0);
 		Out->SetBoolField(TEXT("has_data"),   false);
-		return LAND_MakeSuccessObj(Request, Out);
+		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 	}
 
 	// Sample a single-quad region via the sparse TMap variant. The Get* call may CLAMP the requested
@@ -424,7 +368,7 @@ FMCPResponse Tool_GetHeightAt(const FMCPRequest& Request)
 		// unloaded tiles in the queried region.
 		Out->SetNumberField(TEXT("height_z"), 0.0);
 		Out->SetBoolField(TEXT("has_data"),   false);
-		return LAND_MakeSuccessObj(Request, Out);
+		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 	}
 
 	// Convert local-Z (centered around 0 in landscape actor space) → world-Z. Apply landscape's
@@ -439,7 +383,7 @@ FMCPResponse Tool_GetHeightAt(const FMCPRequest& Request)
 
 	Out->SetNumberField(TEXT("height_z"), WorldZ);
 	Out->SetBoolField(TEXT("has_data"),   true);
-	return LAND_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── landscape.get_layer_weights ─────────────────────────────────────────────────────────────────
@@ -472,21 +416,21 @@ FMCPResponse Tool_GetLayerWeights(const FMCPRequest& Request)
 
 	FString LandscapePath;
 	FMCPResponse Err;
-	if (!LAND_RequireStringField(Request, TEXT("landscape_path"), LandscapePath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("landscape_path"), LandscapePath, Err)) { return Err; }
 
 	double WorldX = 0.0, WorldY = 0.0;
-	if (!LAND_RequireNumberField(Request, TEXT("world_x"), WorldX, Err)) { return Err; }
-	if (!LAND_RequireNumberField(Request, TEXT("world_y"), WorldY, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireNumberField(Request, TEXT("world_x"), WorldX, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireNumberField(Request, TEXT("world_y"), WorldY, Err)) { return Err; }
 
 	int32 ResolveErrCode = 0;
 	FString ResolveErr;
 	ALandscape* LS = LAND_ResolveLandscape(LandscapePath, ResolveErrCode, ResolveErr);
-	if (!LS) { return LAND_MakeError(Request, ResolveErrCode, ResolveErr); }
+	if (!LS) { return FMCPToolHelpers::MakeError(Request, ResolveErrCode, ResolveErr); }
 
 	ULandscapeInfo* LSI = LS->GetLandscapeInfo();
 	if (!LSI)
 	{
-		return LAND_MakeError(Request, kLANDErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kLANDErrorInternal,
 			FString::Printf(
 				TEXT("landscape '%s' has no ULandscapeInfo (un-registered or mid-load proxy)"),
 				*LandscapePath));
@@ -501,7 +445,7 @@ FMCPResponse Tool_GetLayerWeights(const FMCPRequest& Request)
 	{
 		Out->SetObjectField(TEXT("weights"), WeightsObj);
 		Out->SetBoolField(TEXT("has_data"),  false);
-		return LAND_MakeSuccessObj(Request, Out);
+		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 	}
 
 	FLandscapeEditDataInterface LandscapeEdit(LSI, /*bInUploadTextureChangesToGPU*/ false);
@@ -526,7 +470,7 @@ FMCPResponse Tool_GetLayerWeights(const FMCPRequest& Request)
 
 	Out->SetObjectField(TEXT("weights"), WeightsObj);
 	Out->SetBoolField(TEXT("has_data"),  bAnyData);
-	return LAND_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ────────────────────────────────────────────────────────────────────────────────

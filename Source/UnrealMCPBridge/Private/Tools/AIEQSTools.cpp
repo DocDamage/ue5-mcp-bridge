@@ -3,6 +3,8 @@
 #include "AIEQSTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPAssetLoader.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
 #include "Utils/MCPAssetPathUtils.h"
@@ -31,98 +33,13 @@ namespace
 {
 	// AIEQS_ prefix per the unity-build symbol-collision convention. The plugin uses unity builds so
 	// anonymous-namespace helpers MUST be uniquely prefixed across every Tools/*.cpp.
-	constexpr int32 kAIEQSErrorInvalidParams   = -32602;
+	//
+	// Phase 2 (Pair E, Wave J AI sub-2): generic StampIds / MakeError / MakeSuccessObj /
+	// RequireStringField + AIEQS_LoadQueryByPath retired in favour of FMCPToolHelpers::Xxx +
+	// FMCPAssetLoader::Load<UEnvQuery>. Only the surface-specific error constants stay (Phase 4
+	// sweep target).
 	constexpr int32 kAIEQSErrorInternal        = -32603;
 	constexpr int32 kAIEQSErrorOperationFailed = -32015; // Brief reuses the StaleCursor slot here.
-
-	void AIEQS_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse AIEQS_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		AIEQS_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse AIEQS_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		AIEQS_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
-	bool AIEQS_RequireStringField(const FMCPRequest& Request, const TCHAR* FieldName,
-		FString& OutValue, FMCPResponse& OutError)
-	{
-		if (!Request.Args.IsValid())
-		{
-			OutError = AIEQS_MakeError(Request, kAIEQSErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetStringField(FieldName, OutValue) || OutValue.IsEmpty())
-		{
-			OutError = AIEQS_MakeError(Request, kAIEQSErrorInvalidParams,
-				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
-			return false;
-		}
-		return true;
-	}
-
-	/**
-	 * Load a UEnvQuery by path. Returns null on failure with OutErrorCode/OutError populated.
-	 * Mirrors the DataTableTools / CurveTools loader shape — first tries the normalised path as-is
-	 * (works for "/Game/Foo/Bar" + "/Game/Foo/Bar.Bar"), then falls back to the object-path variant
-	 * if the first attempt fails.
-	 */
-	UEnvQuery* AIEQS_LoadQueryByPath(const FString& Path, int32& OutErrorCode, FString& OutError)
-	{
-		if (Path.IsEmpty())
-		{
-			OutErrorCode = kMCPErrorInvalidPath;
-			OutError = TEXT("query_path is empty");
-			return nullptr;
-		}
-		const FString Normalised = FMCPAssetPathUtils::Normalize(Path);
-		if (Normalised.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(Normalised))
-		{
-			OutErrorCode = kMCPErrorInvalidPath;
-			OutError = FString::Printf(TEXT("query_path '%s' malformed or unknown mount"), *Path);
-			return nullptr;
-		}
-		UObject* Loaded = LoadObject<UObject>(nullptr, *Normalised);
-		if (!Loaded)
-		{
-			const FString ObjPath = FMCPAssetPathUtils::ToObjectPath(Normalised);
-			if (!ObjPath.IsEmpty() && ObjPath != Normalised)
-			{
-				Loaded = LoadObject<UObject>(nullptr, *ObjPath);
-			}
-		}
-		if (!Loaded)
-		{
-			OutErrorCode = kMCPErrorObjectNotFound;
-			OutError = FString::Printf(TEXT("EQS query '%s' not loadable"), *Path);
-			return nullptr;
-		}
-		UEnvQuery* Query = Cast<UEnvQuery>(Loaded);
-		if (!Query)
-		{
-			OutErrorCode = kMCPErrorWrongClass;
-			OutError = FString::Printf(TEXT("'%s' is class '%s'; expected UEnvQuery"),
-				*Path, *Loaded->GetClass()->GetPathName());
-			return nullptr;
-		}
-		return Query;
-	}
 } // namespace
 
 namespace FAIEQSTools
@@ -183,12 +100,12 @@ FMCPResponse Tool_ListQueries(const FMCPRequest& Request)
 		FString DecodeErr;
 		if (!FMCPPageCursorUtils::Decode(PageToken, InCursor, DecodeErr))
 		{
-			return AIEQS_MakeError(Request, kAIEQSErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 				FString::Printf(TEXT("invalid page_token: %s"), *DecodeErr));
 		}
 		if (!FMCPPageCursorUtils::ValidateAgainstFilter(InCursor, FilterHash))
 		{
-			return AIEQS_MakeError(Request, kMCPErrorStaleCursor,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorStaleCursor,
 				TEXT("filter mutated between pages (path_prefix changed); restart pagination"));
 		}
 		while (StartIdx < Assets.Num() &&
@@ -231,7 +148,7 @@ FMCPResponse Tool_ListQueries(const FMCPRequest& Request)
 		Out->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(OutCursor));
 	}
 
-	return AIEQS_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // --- ai.eqs.get_query_info -------------------------------------------------------------------
@@ -257,12 +174,12 @@ FMCPResponse Tool_GetQueryInfo(const FMCPRequest& Request)
 
 	FString QueryPath;
 	FMCPResponse Err;
-	if (!AIEQS_RequireStringField(Request, TEXT("query_path"), QueryPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("query_path"), QueryPath, Err)) { return Err; }
 
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
-	UEnvQuery* Query = AIEQS_LoadQueryByPath(QueryPath, LoadErrCode, LoadErrMsg);
-	if (!Query) { return AIEQS_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	UEnvQuery* Query = FMCPAssetLoader::Load<UEnvQuery>(QueryPath, LoadErrCode, LoadErrMsg);
+	if (!Query) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	const TArray<UEnvQueryOption*>& Options = Query->GetOptions();
 	TArray<TSharedPtr<FJsonValue>> OptionArr;
@@ -329,7 +246,7 @@ FMCPResponse Tool_GetQueryInfo(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("query_path"), QueryPath);
 	Out->SetNumberField(TEXT("options_count"), Options.Num());
 	Out->SetArrayField(TEXT("options"), OptionArr);
-	return AIEQS_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // --- ai.eqs.run_query ------------------------------------------------------------------------
@@ -356,8 +273,8 @@ FMCPResponse Tool_RunQuery(const FMCPRequest& Request)
 
 	FString QueryPath, QuerierPath;
 	FMCPResponse Err;
-	if (!AIEQS_RequireStringField(Request, TEXT("query_path"),         QueryPath,   Err)) { return Err; }
-	if (!AIEQS_RequireStringField(Request, TEXT("querier_actor_path"), QuerierPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("query_path"),         QueryPath,   Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("querier_actor_path"), QuerierPath, Err)) { return Err; }
 
 	FString ModeStr = TEXT("single_best");
 	if (Request.Args.IsValid())
@@ -375,15 +292,15 @@ FMCPResponse Tool_RunQuery(const FMCPRequest& Request)
 	}
 	else
 	{
-		return AIEQS_MakeError(Request, kAIEQSErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			FString::Printf(TEXT("unknown mode '%s'; expected 'single_best' or 'all_matching'"), *ModeStr));
 	}
 
 	// Load query asset.
 	int32 QueryLoadErrCode = 0;
 	FString QueryLoadErrMsg;
-	UEnvQuery* Query = AIEQS_LoadQueryByPath(QueryPath, QueryLoadErrCode, QueryLoadErrMsg);
-	if (!Query) { return AIEQS_MakeError(Request, QueryLoadErrCode, QueryLoadErrMsg); }
+	UEnvQuery* Query = FMCPAssetLoader::Load<UEnvQuery>(QueryPath, QueryLoadErrCode, QueryLoadErrMsg);
+	if (!Query) { return FMCPToolHelpers::MakeError(Request, QueryLoadErrCode, QueryLoadErrMsg); }
 
 	// Resolve querier actor — bRejectPIE=false so PIE actors are addressable.
 	bool bAmbiguous = false;
@@ -399,7 +316,7 @@ FMCPResponse Tool_RunQuery(const FMCPRequest& Request)
 		{
 			Msg.Append(FString::Printf(TEXT(" (ambiguous candidates: %s)"), *AmbiguityHint));
 		}
-		return AIEQS_MakeError(Request, kMCPErrorObjectNotFound, Msg);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound, Msg);
 	}
 
 	// Get the EQS manager for the querier's world. Editor-world querier → editor manager;
@@ -408,13 +325,13 @@ FMCPResponse Tool_RunQuery(const FMCPRequest& Request)
 	UWorld* QuerierWorld = Querier->GetWorld();
 	if (!QuerierWorld)
 	{
-		return AIEQS_MakeError(Request, kAIEQSErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kAIEQSErrorInternal,
 			FString::Printf(TEXT("querier '%s' has no UWorld"), *QuerierPath));
 	}
 	UEnvQueryManager* EQM = UEnvQueryManager::GetCurrent(QuerierWorld);
 	if (!EQM)
 	{
-		return AIEQS_MakeError(Request, kAIEQSErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kAIEQSErrorInternal,
 			FString::Printf(TEXT("UEnvQueryManager not available for querier's world '%s'"),
 				*QuerierWorld->GetName()));
 	}
@@ -425,7 +342,7 @@ FMCPResponse Tool_RunQuery(const FMCPRequest& Request)
 
 	if (!Result.IsValid())
 	{
-		return AIEQS_MakeError(Request, kAIEQSErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kAIEQSErrorInternal,
 			TEXT("RunInstantQuery returned null result pointer"));
 	}
 
@@ -448,7 +365,7 @@ FMCPResponse Tool_RunQuery(const FMCPRequest& Request)
 	// terminal call) but treat it as Failed-equivalent for defensiveness.
 	if (!Result->IsSuccessful())
 	{
-		return AIEQS_MakeError(Request, kAIEQSErrorOperationFailed,
+		return FMCPToolHelpers::MakeError(Request, kAIEQSErrorOperationFailed,
 			FString::Printf(TEXT("EQS query '%s' returned status '%s'"), *QueryPath, StatusStr));
 	}
 
@@ -464,7 +381,7 @@ FMCPResponse Tool_RunQuery(const FMCPRequest& Request)
 	// an engine-level invariant break — surface as InternalError rather than producing junk results.
 	if (Locations.Num() != Result->Items.Num())
 	{
-		return AIEQS_MakeError(Request, kAIEQSErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kAIEQSErrorInternal,
 			FString::Printf(TEXT("EQS result invariant break: %d items, %d locations"),
 				Result->Items.Num(), Locations.Num()));
 	}
@@ -507,7 +424,7 @@ FMCPResponse Tool_RunQuery(const FMCPRequest& Request)
 	Out->SetArrayField(TEXT("results"), ResultArr);
 	Out->SetStringField(TEXT("query_path"), QueryPath);
 	Out->SetStringField(TEXT("querier_actor_path"), QuerierPath);
-	return AIEQS_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // --- Registration ----------------------------------------------------------------------------

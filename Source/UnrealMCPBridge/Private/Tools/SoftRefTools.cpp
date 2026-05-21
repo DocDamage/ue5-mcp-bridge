@@ -3,6 +3,8 @@
 #include "SoftRefTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPMutatorScope.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPAssetPathUtils.h"
 #include "Utils/MCPPageCursor.h"
@@ -14,7 +16,6 @@
 #include "AssetRegistry/IAssetRegistry.h"
 #include "AssetToolsModule.h"
 #include "IAssetTools.h"
-#include "ScopedTransaction.h"
 #include "UObject/ObjectRedirector.h"
 #include "UObject/Package.h"
 #include "UObject/SoftObjectPath.h"
@@ -28,50 +29,12 @@
 namespace
 {
 	// SR_ prefix per the unity-build symbol-collision convention.
+	//
+	// XX_StampIds / XX_MakeError / XX_MakeSuccessObj / XX_RequireStringField removed in Phase 2 —
+	// use FMCPToolHelpers::Xxx from MCPToolHelpers.h. Per-surface error constants kept for now
+	// (Phase 4 sweep target).
 	constexpr int32 kSRErrorInvalidParams = -32602;
 	constexpr int32 kSRErrorInternal      = -32603;
-
-	void SR_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse SR_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		SR_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse SR_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		SR_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
-	bool SR_RequireStringField(const FMCPRequest& Request, const TCHAR* FieldName,
-		FString& OutValue, FMCPResponse& OutError)
-	{
-		if (!Request.Args.IsValid())
-		{
-			OutError = SR_MakeError(Request, kSRErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetStringField(FieldName, OutValue) || OutValue.IsEmpty())
-		{
-			OutError = SR_MakeError(Request, kSRErrorInvalidParams,
-				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
-			return false;
-		}
-		return true;
-	}
 
 	/**
 	 * Build an FSoftObjectPath from an arbitrary caller string. Returns the parsed path; the
@@ -146,18 +109,18 @@ FMCPResponse Tool_Validate(const FMCPRequest& Request)
 
 	FString SoftPathStr;
 	FMCPResponse Err;
-	if (!SR_RequireStringField(Request, TEXT("soft_path"), SoftPathStr, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("soft_path"), SoftPathStr, Err)) { return Err; }
 
 	bool bValidSyntax = false;
 	const FSoftObjectPath Soft = SR_ParseSoftPath(SoftPathStr, bValidSyntax);
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("valid_syntax"), bValidSyntax);
 
 	if (!bValidSyntax)
 	{
 		Out->SetBoolField(TEXT("target_exists"), false);
-		return SR_MakeSuccessObj(Request, Out);
+		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 	}
 
 	IAssetRegistry& AR = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
@@ -170,7 +133,7 @@ FMCPResponse Tool_Validate(const FMCPRequest& Request)
 		Out->SetStringField(TEXT("target_class"), Data.AssetClassPath.ToString());
 	}
 
-	return SR_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── soft_ref.resolve ────────────────────────────────────────────────────────────────────────
@@ -196,7 +159,7 @@ FMCPResponse Tool_Resolve(const FMCPRequest& Request)
 
 	FString SoftPathStr;
 	FMCPResponse Err;
-	if (!SR_RequireStringField(Request, TEXT("soft_path"), SoftPathStr, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("soft_path"), SoftPathStr, Err)) { return Err; }
 
 	bool bForceLoad = false;
 	if (Request.Args.IsValid()) { Request.Args->TryGetBoolField(TEXT("force_load"), bForceLoad); }
@@ -205,11 +168,11 @@ FMCPResponse Tool_Resolve(const FMCPRequest& Request)
 	const FSoftObjectPath Soft = SR_ParseSoftPath(SoftPathStr, bValidSyntax);
 	if (!bValidSyntax)
 	{
-		return SR_MakeError(Request, kMCPErrorInvalidPath,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 			FString::Printf(TEXT("soft_path '%s' is not a valid FSoftObjectPath"), *SoftPathStr));
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 
 	// Probe for an already-loaded object first (Soft.ResolveObject is non-loading).
 	UObject* Resolved = Soft.ResolveObject();
@@ -227,7 +190,7 @@ FMCPResponse Tool_Resolve(const FMCPRequest& Request)
 	{
 		Out->SetStringField(TEXT("resolved_path"), Resolved->GetPathName());
 		Out->SetStringField(TEXT("target_class"), Resolved->GetClass()->GetPathName());
-		return SR_MakeSuccessObj(Request, Out);
+		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 	}
 
 	// Not loaded (and either force_load=false or force_load attempt failed). Fall back to AR:
@@ -249,7 +212,7 @@ FMCPResponse Tool_Resolve(const FMCPRequest& Request)
 	// Otherwise: resolved_path absent, was_loaded=false. Still a success — caller uses validate
 	// to disambiguate "no asset" from "asset present but unloaded".
 
-	return SR_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── soft_ref.find_redirectors ───────────────────────────────────────────────────────────────
@@ -307,12 +270,12 @@ FMCPResponse Tool_FindRedirectors(const FMCPRequest& Request)
 		FString DecodeErr;
 		if (!FMCPPageCursorUtils::Decode(PageToken, InCursor, DecodeErr))
 		{
-			return SR_MakeError(Request, kSRErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kSRErrorInvalidParams,
 				FString::Printf(TEXT("invalid page_token: %s"), *DecodeErr));
 		}
 		if (!FMCPPageCursorUtils::ValidateAgainstFilter(InCursor, FilterHash))
 		{
-			return SR_MakeError(Request, kMCPErrorStaleCursor,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorStaleCursor,
 				TEXT("filter mutated between pages (path_prefix changed); restart pagination"));
 		}
 		while (StartIdx < Redirectors.Num() &&
@@ -361,7 +324,7 @@ FMCPResponse Tool_FindRedirectors(const FMCPRequest& Request)
 		Out->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(OutCursor));
 	}
 
-	return SR_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── soft_ref.fix_redirectors ────────────────────────────────────────────────────────────────
@@ -389,16 +352,19 @@ FMCPResponse Tool_FixRedirectors(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return SR_MakeError(Request, kSRErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kSRErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	bool bDryRun = false;
 	Request.Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
 
-	// PIE guard only when actually mutating.
+	// PIE guard only when actually mutating. Inline (not via FMCPMutatorScope) because dry_run
+	// must bypass it AND we want the early bail BEFORE the candidate AR walk runs. The mutator
+	// scope below re-checks PIE inside the !bDryRun branch — that's a harmless second check
+	// since we've already confirmed PIE inactive here.
 	if (!bDryRun && FMCPWorldContext::IsPIEActive())
 	{
-		return SR_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
 	}
 
 	// Collect explicit redirector_paths (optional).
@@ -422,7 +388,7 @@ FMCPResponse Tool_FixRedirectors(const FMCPRequest& Request)
 
 	if (ExplicitPaths.Num() == 0 && PathPrefix.IsEmpty())
 	{
-		return SR_MakeError(Request, kSRErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kSRErrorInvalidParams,
 			TEXT("soft_ref.fix_redirectors requires EITHER args.redirector_paths (non-empty array) "
 				 "OR args.path_prefix (non-empty string)"));
 	}
@@ -513,7 +479,13 @@ FMCPResponse Tool_FixRedirectors(const FMCPRequest& Request)
 	if (!bDryRun && Loaded.Num() > 0)
 	{
 		FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
-		FScopedTransaction Transaction(LOCTEXT("MCP_SoftRef_FixRedirectors", "Fix Redirectors"));
+		// FMCPMutatorScope handles transaction lifetime; we don't queue any explicit packages
+		// via DirtyPackage() because FixupReferencers internally dirties every package whose
+		// references it patched (and the redirector packages themselves — deleted ones don't
+		// need dirty marking). PIE was already confirmed inactive above; the scope's PIE re-check
+		// will pass without effect.
+		FMCPMutatorScope Scope(Request, LOCTEXT("MCP_SoftRef_FixRedirectors", "Fix Redirectors"));
+		if (Scope.PIEBlocked()) return Scope.Error();
 		// FixupReferencers internally walks each redirector's referencers, patches each reference
 		// to point at DestinationObject, then deletes the redirector (via the
 		// ERedirectFixupMode::DeleteFixedUpRedirectors flag). It does NOT return a count — we
@@ -537,7 +509,7 @@ FMCPResponse Tool_FixRedirectors(const FMCPRequest& Request)
 	Out->SetNumberField(TEXT("skipped"), Skipped);
 	Out->SetArrayField(TEXT("errors"), ErrorArr);
 	if (bDryRun) { Out->SetBoolField(TEXT("dry_run"), true); }
-	return SR_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ─────────────────────────────────────────────────────────────────────────────

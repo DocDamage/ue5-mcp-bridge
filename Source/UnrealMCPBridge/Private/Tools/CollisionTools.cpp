@@ -3,6 +3,7 @@
 #include "CollisionTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 
 #include "Engine/CollisionProfile.h"
@@ -18,51 +19,8 @@
 namespace
 {
 	// COLL_ prefix per the unity-build symbol-collision convention.
-	constexpr int32 kCOLLErrorInvalidParams   = -32602;
 	constexpr int32 kCOLLErrorInternal        = -32603;
 	constexpr int32 kCOLLErrorObjectNotFound  = kMCPErrorObjectNotFound; // -32004
-
-	void COLL_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse COLL_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		COLL_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse COLL_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		COLL_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
-	bool COLL_RequireStringField(const FMCPRequest& Request, const TCHAR* FieldName,
-		FString& OutValue, FMCPResponse& OutError)
-	{
-		if (!Request.Args.IsValid())
-		{
-			OutError = COLL_MakeError(Request, kCOLLErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetStringField(FieldName, OutValue) || OutValue.IsEmpty())
-		{
-			OutError = COLL_MakeError(Request, kCOLLErrorInvalidParams,
-				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
-			return false;
-		}
-		return true;
-	}
 
 	/** Map ECollisionResponse → wire string. */
 	const TCHAR* COLL_ResponseToString(ECollisionResponse Response)
@@ -218,7 +176,7 @@ FMCPResponse Tool_ListChannels(const FMCPRequest& Request)
 	const UCollisionProfile* CP = UCollisionProfile::Get();
 	if (!CP)
 	{
-		return COLL_MakeError(Request, kCOLLErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kCOLLErrorInternal,
 			TEXT("UCollisionProfile::Get() returned null (Engine collision subsystem not initialised)"));
 	}
 
@@ -246,7 +204,7 @@ FMCPResponse Tool_ListChannels(const FMCPRequest& Request)
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetArrayField(TEXT("trace_channels"), TraceArr);
 	Out->SetArrayField(TEXT("object_channels"), ObjectArr);
-	return COLL_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── collision.list_profiles ────────────────────────────────────────────────────────────────────
@@ -263,7 +221,7 @@ FMCPResponse Tool_ListProfiles(const FMCPRequest& Request)
 	const UCollisionProfile* CP = UCollisionProfile::Get();
 	if (!CP)
 	{
-		return COLL_MakeError(Request, kCOLLErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kCOLLErrorInternal,
 			TEXT("UCollisionProfile::Get() returned null (Engine collision subsystem not initialised)"));
 	}
 
@@ -296,7 +254,7 @@ FMCPResponse Tool_ListProfiles(const FMCPRequest& Request)
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetArrayField(TEXT("profiles"), Arr);
-	return COLL_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── collision.get_profile ──────────────────────────────────────────────────────────────────────
@@ -313,12 +271,12 @@ FMCPResponse Tool_GetProfile(const FMCPRequest& Request)
 
 	FString ProfileNameStr;
 	FMCPResponse Err;
-	if (!COLL_RequireStringField(Request, TEXT("profile_name"), ProfileNameStr, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("profile_name"), ProfileNameStr, Err)) { return Err; }
 
 	const UCollisionProfile* CP = UCollisionProfile::Get();
 	if (!CP)
 	{
-		return COLL_MakeError(Request, kCOLLErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kCOLLErrorInternal,
 			TEXT("UCollisionProfile::Get() returned null (Engine collision subsystem not initialised)"));
 	}
 
@@ -326,7 +284,7 @@ FMCPResponse Tool_GetProfile(const FMCPRequest& Request)
 	FCollisionResponseTemplate Tpl;
 	if (!CP->GetProfileTemplate(ProfileName, Tpl))
 	{
-		return COLL_MakeError(Request, kCOLLErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kCOLLErrorObjectNotFound,
 			FString::Printf(TEXT("collision profile '%s' not found; use collision.list_profiles to enumerate"),
 				*ProfileNameStr));
 	}
@@ -350,7 +308,7 @@ FMCPResponse Tool_GetProfile(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("helper_description"), FString());
 #endif
 	Out->SetObjectField(TEXT("response_to_channels"), ResponsesObj);
-	return COLL_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── collision.set_profile_response ─────────────────────────────────────────────────────────────
@@ -377,14 +335,14 @@ FMCPResponse Tool_SetProfileResponse(const FMCPRequest& Request)
 
 	FString ProfileNameStr, ChannelNameStr, ResponseStr;
 	FMCPResponse Err;
-	if (!COLL_RequireStringField(Request, TEXT("profile_name"), ProfileNameStr, Err)) { return Err; }
-	if (!COLL_RequireStringField(Request, TEXT("channel_name"), ChannelNameStr, Err)) { return Err; }
-	if (!COLL_RequireStringField(Request, TEXT("response"),     ResponseStr,    Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("profile_name"), ProfileNameStr, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("channel_name"), ChannelNameStr, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("response"),     ResponseStr,    Err)) { return Err; }
 
 	ECollisionResponse NewResponse;
 	if (!COLL_ParseResponse(ResponseStr, NewResponse))
 	{
-		return COLL_MakeError(Request, kCOLLErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			FString::Printf(TEXT("'response' must be 'Block', 'Overlap', or 'Ignore' (got '%s')"),
 				*ResponseStr));
 	}
@@ -392,7 +350,7 @@ FMCPResponse Tool_SetProfileResponse(const FMCPRequest& Request)
 	UCollisionProfile* CP = UCollisionProfile::Get();
 	if (!CP)
 	{
-		return COLL_MakeError(Request, kCOLLErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kCOLLErrorInternal,
 			TEXT("UCollisionProfile::Get() returned null (Engine collision subsystem not initialised)"));
 	}
 
@@ -402,7 +360,7 @@ FMCPResponse Tool_SetProfileResponse(const FMCPRequest& Request)
 		FCollisionResponseTemplate ProbeTpl;
 		if (!CP->GetProfileTemplate(ProfileName, ProbeTpl))
 		{
-			return COLL_MakeError(Request, kCOLLErrorObjectNotFound,
+			return FMCPToolHelpers::MakeError(Request, kCOLLErrorObjectNotFound,
 				FString::Printf(TEXT("collision profile '%s' not found; use collision.list_profiles to enumerate"),
 					*ProfileNameStr));
 		}
@@ -426,7 +384,7 @@ FMCPResponse Tool_SetProfileResponse(const FMCPRequest& Request)
 	}
 	if (ChannelIndex == INDEX_NONE)
 	{
-		return COLL_MakeError(Request, kCOLLErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kCOLLErrorObjectNotFound,
 			FString::Printf(TEXT("channel '%s' not registered; use collision.list_channels to enumerate"),
 				*ChannelNameStr));
 	}
@@ -441,7 +399,7 @@ FMCPResponse Tool_SetProfileResponse(const FMCPRequest& Request)
 	if (!LiveTpl)
 	{
 		// Should never happen — GetProfileTemplate succeeded above. Defensive guard.
-		return COLL_MakeError(Request, kCOLLErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kCOLLErrorInternal,
 			FString::Printf(TEXT("UCollisionProfile::Profiles array missing entry for '%s' after "
 				"GetProfileTemplate succeeded (engine state inconsistent)"), *ProfileNameStr));
 	}
@@ -471,7 +429,7 @@ FMCPResponse Tool_SetProfileResponse(const FMCPRequest& Request)
 	{
 		// We've still mutated in-memory but the ini write failed. Surface the error so the caller
 		// knows persistence didn't happen (the change will revert on editor restart).
-		return COLL_MakeError(Request, kCOLLErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kCOLLErrorInternal,
 			FString::Printf(TEXT("in-memory profile updated, but TryUpdateDefaultConfigFile failed "
 				"to write DefaultEngine.ini for profile '%s' / channel '%s' — check file permissions "
 				"or source-control check-out"), *ProfileNameStr, *ChannelNameStr));
@@ -481,7 +439,7 @@ FMCPResponse Tool_SetProfileResponse(const FMCPRequest& Request)
 	Out->SetBoolField(TEXT("updated"), true);
 	Out->SetStringField(TEXT("prior_response"), COLL_ResponseToString(PriorResponse));
 	Out->SetBoolField(TEXT("persisted_to_ini"), bPersisted);
-	return COLL_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ─────────────────────────────────────────────────────────────────────────────

@@ -3,10 +3,11 @@
 #include "SequencerExtTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPAssetLoader.h"
+#include "MCPMutatorScope.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
-#include "Utils/MCPAssetPathUtils.h"
-#include "Utils/MCPWorldContext.h"
 
 #include "GameFramework/Actor.h"
 #include "LevelSequence.h"
@@ -16,7 +17,6 @@
 #include "MovieSceneBinding.h"
 #include "MovieSceneSection.h"
 #include "MovieSceneTrack.h"
-#include "ScopedTransaction.h"
 #include "Sections/MovieScene3DTransformSection.h"
 #include "Sections/MovieSceneFloatSection.h"
 #include "Sections/MovieSceneVisibilitySection.h"
@@ -35,114 +35,9 @@ namespace
 {
 	// SEQX_ prefix per the unity-build symbol-collision convention. Sibling SequencerTools.cpp
 	// uses SEQ_ — separate prefixes prevent ODR clashes when both TUs land in the same unity blob.
-	constexpr int32 kSEQXErrorInvalidParams = -32602;
+	// Stamping / require-string / load-by-path / success / generic-error helpers now live in
+	// FMCPToolHelpers + FMCPAssetLoader; only domain-specific helpers remain here.
 	constexpr int32 kSEQXErrorInternal      = -32603;
-
-	void SEQX_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse SEQX_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		SEQX_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse SEQX_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		SEQX_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
-	bool SEQX_RequireStringField(const FMCPRequest& Request, const TCHAR* FieldName,
-		FString& OutValue, FMCPResponse& OutError)
-	{
-		if (!Request.Args.IsValid())
-		{
-			OutError = SEQX_MakeError(Request, kSEQXErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetStringField(FieldName, OutValue) || OutValue.IsEmpty())
-		{
-			OutError = SEQX_MakeError(Request, kSEQXErrorInvalidParams,
-				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
-			return false;
-		}
-		return true;
-	}
-
-	/**
-	 * Load a ULevelSequence by path. Mirrors SequencerTools.cpp's SEQ_LoadLevelSequenceByPath
-	 * verbatim — duplicated rather than promoted to a header because the helper is a 50-line
-	 * boilerplate and adding cross-TU coupling for a single internal helper would create a
-	 * worse maintenance surface than this minor copy. If a third Sequencer TU lands we'll
-	 * extract to a shared utility module.
-	 *
-	 * Error map:
-	 *   -32010 InvalidPath          — empty path, backslashes, unknown mount
-	 *   -32004 ObjectNotFound       — LoadObject returned null
-	 *   -32011 WrongClass           — loaded asset isn't a ULevelSequence
-	 */
-	ULevelSequence* SEQX_LoadLevelSequenceByPath(
-		const FString& Path,
-		int32& OutErrorCode,
-		FString& OutError)
-	{
-		if (Path.IsEmpty())
-		{
-			OutErrorCode = kMCPErrorInvalidPath;
-			OutError = TEXT("sequence_path is empty");
-			return nullptr;
-		}
-
-		const FString Normalised = FMCPAssetPathUtils::Normalize(Path);
-		if (Normalised.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(Normalised))
-		{
-			OutErrorCode = kMCPErrorInvalidPath;
-			OutError = FString::Printf(
-				TEXT("sequence_path '%s' is malformed or references an unknown mount point"),
-				*Path);
-			return nullptr;
-		}
-
-		UObject* Loaded = LoadObject<UObject>(nullptr, *Normalised);
-		if (!Loaded)
-		{
-			const FString ObjectPath = FMCPAssetPathUtils::ToObjectPath(Normalised);
-			if (!ObjectPath.IsEmpty() && ObjectPath != Normalised)
-			{
-				Loaded = LoadObject<UObject>(nullptr, *ObjectPath);
-			}
-		}
-		if (!Loaded)
-		{
-			OutErrorCode = kMCPErrorObjectNotFound;
-			OutError = FString::Printf(
-				TEXT("sequence_path '%s' could not be loaded (no asset found)"),
-				*Path);
-			return nullptr;
-		}
-
-		ULevelSequence* Seq = Cast<ULevelSequence>(Loaded);
-		if (!Seq)
-		{
-			OutErrorCode = kMCPErrorWrongClass;
-			OutError = FString::Printf(
-				TEXT("sequence_path '%s' is class '%s'; expected ULevelSequence"),
-				*Path, *Loaded->GetClass()->GetPathName());
-			return nullptr;
-		}
-		return Seq;
-	}
 
 	/**
 	 * Resolve a designer-facing track-class string to a concrete UMovieSceneTrack subclass.
@@ -264,29 +159,24 @@ FMCPResponse Tool_AddPossessable(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return SEQX_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
-
 	FString SeqPath, ActorPathRaw;
 	FMCPResponse Err;
-	if (!SEQX_RequireStringField(Request, TEXT("sequence_path"), SeqPath, Err)) { return Err; }
-	if (!SEQX_RequireStringField(Request, TEXT("actor_path"),    ActorPathRaw, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("sequence_path"), SeqPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("actor_path"),    ActorPathRaw, Err)) { return Err; }
 
 	// Optional label — defaults to actor's display label if omitted.
 	FString LabelOverride;
 	Request.Args->TryGetStringField(TEXT("label"), LabelOverride);
 
-	int32 ErrCode = 0;
-	FString ErrMsg;
-	ULevelSequence* Seq = SEQX_LoadLevelSequenceByPath(SeqPath, ErrCode, ErrMsg);
-	if (!Seq) { return SEQX_MakeError(Request, ErrCode, ErrMsg); }
+	int32 LoadErrorCode = 0;
+	FString LoadErrorMessage;
+	ULevelSequence* Seq = FMCPAssetLoader::Load<ULevelSequence>(SeqPath, LoadErrorCode, LoadErrorMessage);
+	if (!Seq) { return FMCPToolHelpers::MakeError(Request, LoadErrorCode, LoadErrorMessage); }
 
 	UMovieScene* MovieScene = Seq->GetMovieScene();
 	if (!MovieScene)
 	{
-		return SEQX_MakeError(Request, kSEQXErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kSEQXErrorInternal,
 			FString::Printf(TEXT("sequence '%s' has no MovieScene"), *SeqPath));
 	}
 
@@ -303,19 +193,20 @@ FMCPResponse Tool_AddPossessable(const FMCPRequest& Request)
 				*ActorPathRaw, *AmbiguityHint)
 			: FString::Printf(TEXT("actor_path '%s' not found: %s"),
 				*ActorPathRaw, *ActorErr);
-		return SEQX_MakeError(Request, kMCPErrorObjectNotFound, FullMsg);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound, FullMsg);
 	}
 
 	const FString FinalLabel = LabelOverride.IsEmpty() ? Actor->GetActorLabel() : LabelOverride;
 
-	FScopedTransaction Transaction(LOCTEXT("MCP_AddPossessable", "Add Sequencer Possessable"));
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_AddPossessable", "Add Sequencer Possessable"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 	MovieScene->Modify();
 	Seq->Modify();
 
 	const FGuid PossessableGuid = MovieScene->AddPossessable(FinalLabel, Actor->GetClass());
 	if (!PossessableGuid.IsValid())
 	{
-		return SEQX_MakeError(Request, kSEQXErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kSEQXErrorInternal,
 			FString::Printf(TEXT("UMovieScene::AddPossessable returned invalid guid for actor '%s' on sequence '%s'"),
 				*FinalLabel, *SeqPath));
 	}
@@ -324,7 +215,7 @@ FMCPResponse Tool_AddPossessable(const FMCPRequest& Request)
 	// the actor itself (editor world or sublevel containing it).
 	Seq->BindPossessableObject(PossessableGuid, *Actor, Actor->GetWorld());
 
-	if (UPackage* Pkg = Seq->GetOutermost()) { Pkg->MarkPackageDirty(); }
+	Scope.DirtyPackage(Seq->GetOutermost());
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("possessable_guid"),
@@ -332,7 +223,7 @@ FMCPResponse Tool_AddPossessable(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor));
 	Out->SetStringField(TEXT("label"),        FinalLabel);
 	Out->SetStringField(TEXT("object_class"), Actor->GetClass()->GetPathName());
-	return SEQX_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── sequencer_ext.add_track ──────────────────────────────────────────────────────────────────
@@ -364,21 +255,16 @@ FMCPResponse Tool_AddTrack(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return SEQX_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
-
 	FString SeqPath, BindingGuidStr, TrackClassName;
 	FMCPResponse Err;
-	if (!SEQX_RequireStringField(Request, TEXT("sequence_path"), SeqPath, Err))         { return Err; }
-	if (!SEQX_RequireStringField(Request, TEXT("binding_guid"),  BindingGuidStr, Err))  { return Err; }
-	if (!SEQX_RequireStringField(Request, TEXT("track_class"),   TrackClassName, Err))  { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("sequence_path"), SeqPath, Err))         { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("binding_guid"),  BindingGuidStr, Err))  { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("track_class"),   TrackClassName, Err))  { return Err; }
 
 	FGuid BindingGuid;
 	if (!SEQX_ParseBindingGuid(BindingGuidStr, BindingGuid))
 	{
-		return SEQX_MakeError(Request, kSEQXErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			FString::Printf(TEXT("binding_guid '%s' is not a valid GUID "
 				"(expected DigitsWithHyphens form, e.g. '12345678-1234-1234-1234-123456789012')"),
 				*BindingGuidStr));
@@ -387,45 +273,46 @@ FMCPResponse Tool_AddTrack(const FMCPRequest& Request)
 	UClass* TrackClass = SEQX_ResolveTrackClass(TrackClassName);
 	if (!TrackClass)
 	{
-		return SEQX_MakeError(Request, kSEQXErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			FString::Printf(TEXT("track_class '%s' not recognised "
 				"(accepted: 'Transform', '3DTransform', 'Visibility', 'Float')"),
 				*TrackClassName));
 	}
 
-	int32 ErrCode = 0;
-	FString ErrMsg;
-	ULevelSequence* Seq = SEQX_LoadLevelSequenceByPath(SeqPath, ErrCode, ErrMsg);
-	if (!Seq) { return SEQX_MakeError(Request, ErrCode, ErrMsg); }
+	int32 LoadErrorCode = 0;
+	FString LoadErrorMessage;
+	ULevelSequence* Seq = FMCPAssetLoader::Load<ULevelSequence>(SeqPath, LoadErrorCode, LoadErrorMessage);
+	if (!Seq) { return FMCPToolHelpers::MakeError(Request, LoadErrorCode, LoadErrorMessage); }
 
 	UMovieScene* MovieScene = Seq->GetMovieScene();
 	if (!MovieScene)
 	{
-		return SEQX_MakeError(Request, kSEQXErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kSEQXErrorInternal,
 			FString::Printf(TEXT("sequence '%s' has no MovieScene"), *SeqPath));
 	}
 
 	if (!SEQX_BindingExists(MovieScene, BindingGuid))
 	{
-		return SEQX_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("binding_guid '%s' is not a possessable or spawnable on sequence '%s' "
 				"(use sequencer.get_tracks to enumerate binding GUIDs)"),
 				*BindingGuid.ToString(EGuidFormats::DigitsWithHyphens), *SeqPath));
 	}
 
-	FScopedTransaction Transaction(LOCTEXT("MCP_AddTrack", "Add Sequencer Track"));
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_AddTrack", "Add Sequencer Track"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 	MovieScene->Modify();
 	Seq->Modify();
 
 	UMovieSceneTrack* NewTrack = MovieScene->AddTrack(TrackClass, BindingGuid);
 	if (!NewTrack)
 	{
-		return SEQX_MakeError(Request, kSEQXErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kSEQXErrorInternal,
 			FString::Printf(TEXT("UMovieScene::AddTrack returned null for class '%s' on binding '%s'"),
 				*TrackClass->GetPathName(), *BindingGuid.ToString(EGuidFormats::DigitsWithHyphens)));
 	}
 
-	if (UPackage* Pkg = Seq->GetOutermost()) { Pkg->MarkPackageDirty(); }
+	Scope.DirtyPackage(Seq->GetOutermost());
 
 	// Compute insertion index within the binding's tracks. FindBinding is const-safe here.
 	int32 TrackIndexInBinding = INDEX_NONE;
@@ -441,7 +328,7 @@ FMCPResponse Tool_AddTrack(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("binding_guid"),
 		BindingGuid.ToString(EGuidFormats::DigitsWithHyphens));
 	Out->SetNumberField(TEXT("track_index"), TrackIndexInBinding);
-	return SEQX_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── sequencer_ext.add_section ────────────────────────────────────────────────────────────────
@@ -481,16 +368,11 @@ FMCPResponse Tool_AddSection(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return SEQX_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
-
 	FString SeqPath, BindingGuidStr, TrackClassName;
 	FMCPResponse Err;
-	if (!SEQX_RequireStringField(Request, TEXT("sequence_path"), SeqPath, Err))         { return Err; }
-	if (!SEQX_RequireStringField(Request, TEXT("binding_guid"),  BindingGuidStr, Err))  { return Err; }
-	if (!SEQX_RequireStringField(Request, TEXT("track_class"),   TrackClassName, Err))  { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("sequence_path"), SeqPath, Err))         { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("binding_guid"),  BindingGuidStr, Err))  { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("track_class"),   TrackClassName, Err))  { return Err; }
 
 	// Optional frame fields with sane defaults.
 	int32 StartFrame = 0;
@@ -499,7 +381,7 @@ FMCPResponse Tool_AddSection(const FMCPRequest& Request)
 	Request.Args->TryGetNumberField(TEXT("end_frame"),   EndFrame);
 	if (EndFrame <= StartFrame)
 	{
-		return SEQX_MakeError(Request, kSEQXErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			FString::Printf(TEXT("end_frame (%d) must be greater than start_frame (%d)"),
 				EndFrame, StartFrame));
 	}
@@ -507,7 +389,7 @@ FMCPResponse Tool_AddSection(const FMCPRequest& Request)
 	FGuid BindingGuid;
 	if (!SEQX_ParseBindingGuid(BindingGuidStr, BindingGuid))
 	{
-		return SEQX_MakeError(Request, kSEQXErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			FString::Printf(TEXT("binding_guid '%s' is not a valid GUID "
 				"(expected DigitsWithHyphens form, e.g. '12345678-1234-1234-1234-123456789012')"),
 				*BindingGuidStr));
@@ -516,27 +398,27 @@ FMCPResponse Tool_AddSection(const FMCPRequest& Request)
 	UClass* TrackClass = SEQX_ResolveTrackClass(TrackClassName);
 	if (!TrackClass)
 	{
-		return SEQX_MakeError(Request, kSEQXErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			FString::Printf(TEXT("track_class '%s' not recognised "
 				"(accepted: 'Transform', '3DTransform', 'Visibility', 'Float')"),
 				*TrackClassName));
 	}
 
-	int32 ErrCode = 0;
-	FString ErrMsg;
-	ULevelSequence* Seq = SEQX_LoadLevelSequenceByPath(SeqPath, ErrCode, ErrMsg);
-	if (!Seq) { return SEQX_MakeError(Request, ErrCode, ErrMsg); }
+	int32 LoadErrorCode = 0;
+	FString LoadErrorMessage;
+	ULevelSequence* Seq = FMCPAssetLoader::Load<ULevelSequence>(SeqPath, LoadErrorCode, LoadErrorMessage);
+	if (!Seq) { return FMCPToolHelpers::MakeError(Request, LoadErrorCode, LoadErrorMessage); }
 
 	UMovieScene* MovieScene = Seq->GetMovieScene();
 	if (!MovieScene)
 	{
-		return SEQX_MakeError(Request, kSEQXErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kSEQXErrorInternal,
 			FString::Printf(TEXT("sequence '%s' has no MovieScene"), *SeqPath));
 	}
 
 	if (!SEQX_BindingExists(MovieScene, BindingGuid))
 	{
-		return SEQX_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("binding_guid '%s' is not a possessable or spawnable on sequence '%s'"),
 				*BindingGuid.ToString(EGuidFormats::DigitsWithHyphens), *SeqPath));
 	}
@@ -547,7 +429,7 @@ FMCPResponse Tool_AddSection(const FMCPRequest& Request)
 	const TArray<UMovieSceneTrack*> Tracks = MovieScene->FindTracks(TrackClass, BindingGuid);
 	if (Tracks.Num() == 0)
 	{
-		return SEQX_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("no track of class '%s' exists on binding '%s' "
 				"(create one via sequencer_ext.add_track first)"),
 				*TrackClass->GetPathName(),
@@ -556,14 +438,15 @@ FMCPResponse Tool_AddSection(const FMCPRequest& Request)
 	UMovieSceneTrack* Track = Tracks[0];
 	check(Track != nullptr);
 
-	FScopedTransaction Transaction(LOCTEXT("MCP_AddSection", "Add Sequencer Section"));
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_AddSection", "Add Sequencer Section"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 	MovieScene->Modify();
 	Track->Modify();
 
 	UMovieSceneSection* Section = Track->CreateNewSection();
 	if (!Section)
 	{
-		return SEQX_MakeError(Request, kSEQXErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kSEQXErrorInternal,
 			FString::Printf(TEXT("UMovieSceneTrack::CreateNewSection returned null for class '%s'"),
 				*TrackClass->GetPathName()));
 	}
@@ -571,7 +454,7 @@ FMCPResponse Tool_AddSection(const FMCPRequest& Request)
 	Section->SetRange(TRange<FFrameNumber>(FFrameNumber(StartFrame), FFrameNumber(EndFrame)));
 	Track->AddSection(*Section);
 
-	if (UPackage* Pkg = Seq->GetOutermost()) { Pkg->MarkPackageDirty(); }
+	Scope.DirtyPackage(Seq->GetOutermost());
 
 	const int32 SectionIndex = Track->GetAllSections().Find(Section);
 
@@ -580,7 +463,7 @@ FMCPResponse Tool_AddSection(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("section_class"), Section->GetClass()->GetPathName());
 	Out->SetNumberField(TEXT("start_frame"),   StartFrame);
 	Out->SetNumberField(TEXT("end_frame"),     EndFrame);
-	return SEQX_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

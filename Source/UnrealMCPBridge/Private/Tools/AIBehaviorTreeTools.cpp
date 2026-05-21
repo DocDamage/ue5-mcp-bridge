@@ -3,9 +3,10 @@
 #include "AIBehaviorTreeTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPAssetLoader.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
-#include "Utils/MCPAssetPathUtils.h"
 #include "Utils/MCPPageCursor.h"
 
 #include "AIController.h"
@@ -30,114 +31,9 @@
 
 namespace
 {
-	// AIBT_ prefix per the unity-build symbol-collision convention. The plugin uses unity builds
-	// so anonymous-namespace helpers MUST be uniquely prefixed across every Tools/*.cpp.
-	constexpr int32 kAIBTErrorInvalidParams    = -32602;
-	constexpr int32 kAIBTErrorObjectNotFound   = kMCPErrorObjectNotFound;   // -32004
-	constexpr int32 kAIBTErrorInvalidPath      = kMCPErrorInvalidPath;      // -32010
-	constexpr int32 kAIBTErrorWrongClass       = kMCPErrorWrongClass;       // -32011
-	constexpr int32 kAIBTErrorStaleCursor      = kMCPErrorStaleCursor;      // -32015
-
 	// Hard cap on recursion depth in NodeToJson — guards against pathological / cyclic trees that
 	// somehow slipped past UBehaviorTree::PreSave validation. Real BTs never approach this.
 	constexpr int32 kAIBTMaxRecursionDepth = 64;
-
-	void AIBT_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse AIBT_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		AIBT_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse AIBT_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		AIBT_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
-	bool AIBT_RequireStringField(const FMCPRequest& Request, const TCHAR* FieldName,
-		FString& OutValue, FMCPResponse& OutError)
-	{
-		if (!Request.Args.IsValid())
-		{
-			OutError = AIBT_MakeError(Request, kAIBTErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetStringField(FieldName, OutValue) || OutValue.IsEmpty())
-		{
-			OutError = AIBT_MakeError(Request, kAIBTErrorInvalidParams,
-				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
-			return false;
-		}
-		return true;
-	}
-
-	// ─── UBehaviorTree load (mirrors AnimBlueprintTools' ABP_LoadAnimBlueprintByPath pattern) ─────
-
-	/**
-	 * Resolve a path to a UBehaviorTree. Accepts package-name (``/Game/AI/BT_X``) and object-path
-	 * (``/Game/AI/BT_X.BT_X``) forms — retries with the ``.LeafName`` suffix if the first attempt
-	 * fails. Populates OutErrorCode + OutErrorMsg on failure. Distinguishes:
-	 *   - Malformed path        → -32010 InvalidPath
-	 *   - LoadObject failure    → -32004 ObjectNotFound
-	 *   - Wrong class           → -32011 WrongClass (with actual class name)
-	 */
-	UBehaviorTree* AIBT_LoadBehaviorTreeByPath(const FString& Path, int32& OutErrorCode, FString& OutErrorMsg)
-	{
-		if (Path.IsEmpty())
-		{
-			OutErrorCode = kAIBTErrorInvalidPath;
-			OutErrorMsg = TEXT("bt_path is empty");
-			return nullptr;
-		}
-		const FString Normalised = FMCPAssetPathUtils::Normalize(Path);
-		if (Normalised.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(Normalised))
-		{
-			OutErrorCode = kAIBTErrorInvalidPath;
-			OutErrorMsg = FString::Printf(TEXT("bt_path '%s' malformed or unknown mount"), *Path);
-			return nullptr;
-		}
-
-		UObject* Loaded = LoadObject<UObject>(nullptr, *Normalised);
-		if (!Loaded)
-		{
-			// Retry with the object-path form. Mirrors FMCPBlueprintUtils::LoadBlueprintByPath.
-			const FString ObjPath = FMCPAssetPathUtils::ToObjectPath(Normalised);
-			if (!ObjPath.IsEmpty() && ObjPath != Normalised)
-			{
-				Loaded = LoadObject<UObject>(nullptr, *ObjPath);
-			}
-		}
-		if (!Loaded)
-		{
-			OutErrorCode = kAIBTErrorObjectNotFound;
-			OutErrorMsg = FString::Printf(TEXT("bt_path '%s' not loadable"), *Path);
-			return nullptr;
-		}
-
-		UBehaviorTree* BT = Cast<UBehaviorTree>(Loaded);
-		if (!BT)
-		{
-			OutErrorCode = kAIBTErrorWrongClass;
-			OutErrorMsg = FString::Printf(
-				TEXT("'%s' is of class '%s'; expected UBehaviorTree"),
-				*Path, *Loaded->GetClass()->GetPathName());
-			return nullptr;
-		}
-		return BT;
-	}
 
 	// ─── Actor → AAIController resolution ────────────────────────────────────────────────────────
 
@@ -161,7 +57,7 @@ namespace
 			ActorPath, /*bRejectPIE*/ false, bAmbiguous, AmbigHint, ResolveErr);
 		if (!Actor)
 		{
-			OutErrorCode = kAIBTErrorObjectNotFound;
+			OutErrorCode = kMCPErrorObjectNotFound;
 			OutErrorMsg = bAmbiguous
 				? FString::Printf(TEXT("actor_path '%s' is ambiguous; candidates: %s"), *ActorPath, *AmbigHint)
 				: FString::Printf(TEXT("actor_path '%s' did not resolve: %s"), *ActorPath, *ResolveErr);
@@ -181,7 +77,7 @@ namespace
 			{
 				return AIC;
 			}
-			OutErrorCode = kAIBTErrorWrongClass;
+			OutErrorCode = kMCPErrorWrongClass;
 			OutErrorMsg = FString::Printf(
 				TEXT("pawn '%s' has no AAIController (Controller=%s)"),
 				*ActorPath,
@@ -190,7 +86,7 @@ namespace
 		}
 
 		// Case 3: actor is neither an AAIController nor an APawn.
-		OutErrorCode = kAIBTErrorWrongClass;
+		OutErrorCode = kMCPErrorWrongClass;
 		OutErrorMsg = FString::Printf(
 			TEXT("actor '%s' is of class '%s'; expected AAIController or APawn-with-AAIController"),
 			*ActorPath, *Actor->GetClass()->GetName());
@@ -379,12 +275,12 @@ FMCPResponse Tool_ListAssets(const FMCPRequest& Request)
 		FString DecodeErr;
 		if (!FMCPPageCursorUtils::Decode(PageToken, InCursor, DecodeErr))
 		{
-			return AIBT_MakeError(Request, kAIBTErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 				FString::Printf(TEXT("invalid page_token: %s"), *DecodeErr));
 		}
 		if (!FMCPPageCursorUtils::ValidateAgainstFilter(InCursor, FilterHash))
 		{
-			return AIBT_MakeError(Request, kAIBTErrorStaleCursor,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorStaleCursor,
 				TEXT("filter mutated between pages (path_prefix changed); restart pagination"));
 		}
 		while (StartIdx < Assets.Num() &&
@@ -438,7 +334,7 @@ FMCPResponse Tool_ListAssets(const FMCPRequest& Request)
 		Out->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(OutCursor));
 	}
 
-	return AIBT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── ai.bt.get_nodes ───────────────────────────────────────────────────────────────────────────
@@ -491,17 +387,17 @@ FMCPResponse Tool_GetNodes(const FMCPRequest& Request)
 
 	FString BTPath;
 	FMCPResponse ArgErr;
-	if (!AIBT_RequireStringField(Request, TEXT("bt_path"), BTPath, ArgErr))
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("bt_path"), BTPath, ArgErr))
 	{
 		return ArgErr;
 	}
 
 	int32 ErrCode = 0;
 	FString ErrMsg;
-	UBehaviorTree* BT = AIBT_LoadBehaviorTreeByPath(BTPath, ErrCode, ErrMsg);
+	UBehaviorTree* BT = FMCPAssetLoader::Load<UBehaviorTree>(BTPath, ErrCode, ErrMsg);
 	if (!BT)
 	{
-		return AIBT_MakeError(Request, ErrCode, ErrMsg);
+		return FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg);
 	}
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
@@ -521,7 +417,7 @@ FMCPResponse Tool_GetNodes(const FMCPRequest& Request)
 		Out->SetField(TEXT("root"), MakeShared<FJsonValueNull>());
 	}
 
-	return AIBT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── ai.bt.start_on_actor ──────────────────────────────────────────────────────────────────────
@@ -560,12 +456,12 @@ FMCPResponse Tool_StartOnActor(const FMCPRequest& Request)
 
 	FString ActorPath;
 	FMCPResponse ArgErr;
-	if (!AIBT_RequireStringField(Request, TEXT("actor_path"), ActorPath, ArgErr))
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("actor_path"), ActorPath, ArgErr))
 	{
 		return ArgErr;
 	}
 	FString BTPath;
-	if (!AIBT_RequireStringField(Request, TEXT("bt_path"), BTPath, ArgErr))
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("bt_path"), BTPath, ArgErr))
 	{
 		return ArgErr;
 	}
@@ -575,10 +471,10 @@ FMCPResponse Tool_StartOnActor(const FMCPRequest& Request)
 	// invalid actor path in editor scripting).
 	int32 BTErrCode = 0;
 	FString BTErrMsg;
-	UBehaviorTree* BT = AIBT_LoadBehaviorTreeByPath(BTPath, BTErrCode, BTErrMsg);
+	UBehaviorTree* BT = FMCPAssetLoader::Load<UBehaviorTree>(BTPath, BTErrCode, BTErrMsg);
 	if (!BT)
 	{
-		return AIBT_MakeError(Request, BTErrCode, BTErrMsg);
+		return FMCPToolHelpers::MakeError(Request, BTErrCode, BTErrMsg);
 	}
 
 	int32 AICErrCode = 0;
@@ -586,7 +482,7 @@ FMCPResponse Tool_StartOnActor(const FMCPRequest& Request)
 	AAIController* AIC = AIBT_ResolveAIController(ActorPath, AICErrCode, AICErrMsg);
 	if (!AIC)
 	{
-		return AIBT_MakeError(Request, AICErrCode, AICErrMsg);
+		return FMCPToolHelpers::MakeError(Request, AICErrCode, AICErrMsg);
 	}
 
 	const bool bStarted = AIC->RunBehaviorTree(BT);
@@ -595,7 +491,7 @@ FMCPResponse Tool_StartOnActor(const FMCPRequest& Request)
 	Out->SetBoolField(TEXT("started"), bStarted);
 	Out->SetStringField(TEXT("controller_path"), AIC->GetPathName());
 	Out->SetStringField(TEXT("bt_path"), BT->GetPathName());
-	return AIBT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── ai.bt.stop_on_actor ───────────────────────────────────────────────────────────────────────
@@ -631,7 +527,7 @@ FMCPResponse Tool_StopOnActor(const FMCPRequest& Request)
 
 	FString ActorPath;
 	FMCPResponse ArgErr;
-	if (!AIBT_RequireStringField(Request, TEXT("actor_path"), ActorPath, ArgErr))
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("actor_path"), ActorPath, ArgErr))
 	{
 		return ArgErr;
 	}
@@ -641,7 +537,7 @@ FMCPResponse Tool_StopOnActor(const FMCPRequest& Request)
 	AAIController* AIC = AIBT_ResolveAIController(ActorPath, AICErrCode, AICErrMsg);
 	if (!AIC)
 	{
-		return AIBT_MakeError(Request, AICErrCode, AICErrMsg);
+		return FMCPToolHelpers::MakeError(Request, AICErrCode, AICErrMsg);
 	}
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
@@ -654,7 +550,7 @@ FMCPResponse Tool_StopOnActor(const FMCPRequest& Request)
 	if (!BTC)
 	{
 		Out->SetBoolField(TEXT("stopped"), false);
-		return AIBT_MakeSuccessObj(Request, Out);
+		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 	}
 
 	UBehaviorTree* PriorTree = BTC->GetCurrentTree();
@@ -665,7 +561,7 @@ FMCPResponse Tool_StopOnActor(const FMCPRequest& Request)
 	{
 		Out->SetStringField(TEXT("prior_active_bt"), PriorTree->GetPathName());
 	}
-	return AIBT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

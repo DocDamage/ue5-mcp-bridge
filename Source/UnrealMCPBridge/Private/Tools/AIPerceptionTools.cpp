@@ -3,6 +3,7 @@
 #include "AIPerceptionTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
 #include "Utils/MCPWorldContext.h"
@@ -35,35 +36,14 @@ namespace
 	// AIPER_ prefix per the unity-build symbol-collision convention. Every Tools/*.cpp shares
 	// the same anonymous namespace under unity builds, so helpers MUST be uniquely prefixed —
 	// see the BlueprintComponentTools rename note in MEMORY.md (Wave F4) for the failure mode.
+	//
+	// XX_StampIds / XX_MakeError / XX_MakeSuccessObj removed in Phase 2 — use
+	// FMCPToolHelpers::Xxx from MCPToolHelpers.h. Per-surface error constants kept for now
+	// (Phase 4 sweep target).
 	constexpr int32 kAIPERErrorInvalidParams   = -32602;
 	constexpr int32 kAIPERErrorInternal        = -32603;
 	constexpr int32 kAIPERErrorObjectNotFound  = kMCPErrorObjectNotFound;  // -32004
 	constexpr int32 kAIPERErrorWrongClass      = kMCPErrorWrongClass;      // -32011
-
-	void AIPER_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse AIPER_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		AIPER_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse AIPER_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		AIPER_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
 
 	// ─── World resolution (PIE-first, editor-fallback) ───────────────────────────────────────────
 
@@ -303,7 +283,7 @@ FMCPResponse Tool_ListComponents(const FMCPRequest& Request)
 	UWorld* World = AIPER_ResolveWorld();
 	if (!World)
 	{
-		return AIPER_MakeError(Request, kAIPERErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kAIPERErrorInternal,
 			TEXT("no world available (GEditor missing OR no level loaded)"));
 	}
 
@@ -350,7 +330,7 @@ FMCPResponse Tool_ListComponents(const FMCPRequest& Request)
 	Out->SetArrayField(TEXT("perception_components"), Items);
 	Out->SetNumberField(TEXT("total"), Items.Num());
 	Out->SetStringField(TEXT("world_kind"), WorldKind);
-	return AIPER_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── ai.perception.get_config ─────────────────────────────────────────────────────────────────
@@ -385,16 +365,11 @@ FMCPResponse Tool_GetConfig(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (!Request.Args.IsValid())
-	{
-		return AIPER_MakeError(Request, kAIPERErrorInvalidParams, TEXT("missing args object"));
-	}
-
 	FString ActorPath;
-	if (!Request.Args->TryGetStringField(TEXT("actor_path"), ActorPath) || ActorPath.IsEmpty())
+	FMCPResponse FieldErr;
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("actor_path"), ActorPath, FieldErr))
 	{
-		return AIPER_MakeError(Request, kAIPERErrorInvalidParams,
-			TEXT("missing required string field 'actor_path'"));
+		return FieldErr;
 	}
 
 	AActor* Actor = nullptr;
@@ -404,7 +379,7 @@ FMCPResponse Tool_GetConfig(const FMCPRequest& Request)
 		ActorPath, ErrorCode, ResolveErr, Actor);
 	if (!Perc)
 	{
-		return AIPER_MakeError(Request, ErrorCode, ResolveErr);
+		return FMCPToolHelpers::MakeError(Request, ErrorCode, ResolveErr);
 	}
 
 	const TSubclassOf<UAISense> DominantSense = Perc->GetDominantSense();
@@ -429,7 +404,7 @@ FMCPResponse Tool_GetConfig(const FMCPRequest& Request)
 			AIPER_SenseClassToWireString(DominantClass));
 	}
 	Out->SetArrayField(TEXT("sense_configs"), ConfigItems);
-	return AIPER_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── ai.perception.get_perceived_actors ───────────────────────────────────────────────────────
@@ -477,19 +452,16 @@ FMCPResponse Tool_GetPerceivedActors(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (!Request.Args.IsValid())
-	{
-		return AIPER_MakeError(Request, kAIPERErrorInvalidParams, TEXT("missing args object"));
-	}
-
 	FString ActorPath;
-	if (!Request.Args->TryGetStringField(TEXT("actor_path"), ActorPath) || ActorPath.IsEmpty())
+	FMCPResponse FieldErr;
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("actor_path"), ActorPath, FieldErr))
 	{
-		return AIPER_MakeError(Request, kAIPERErrorInvalidParams,
-			TEXT("missing required string field 'actor_path'"));
+		return FieldErr;
 	}
 
 	// Optional sense filter — resolve early so a malformed string fails before any iteration.
+	// Args.IsValid() guard is implicitly satisfied because RequireStringField above succeeded,
+	// which guarantees Request.Args is a valid TSharedPtr<FJsonObject>.
 	UClass* FilterClass = nullptr;
 	FString FilterRaw;
 	if (Request.Args->TryGetStringField(TEXT("sense_filter"), FilterRaw) && !FilterRaw.IsEmpty())
@@ -498,7 +470,7 @@ FMCPResponse Tool_GetPerceivedActors(const FMCPRequest& Request)
 		FilterClass = AIPER_ResolveSenseClass(FilterRaw, FilterErr);
 		if (!FilterClass)
 		{
-			return AIPER_MakeError(Request, kAIPERErrorInvalidParams, FilterErr);
+			return FMCPToolHelpers::MakeError(Request, kAIPERErrorInvalidParams, FilterErr);
 		}
 	}
 
@@ -509,7 +481,7 @@ FMCPResponse Tool_GetPerceivedActors(const FMCPRequest& Request)
 		ActorPath, ErrorCode, ResolveErr, Actor);
 	if (!Perc)
 	{
-		return AIPER_MakeError(Request, ErrorCode, ResolveErr);
+		return FMCPToolHelpers::MakeError(Request, ErrorCode, ResolveErr);
 	}
 
 	// Pre-resolve the sense-ID → sense-class string mapping by walking the component's sense
@@ -592,7 +564,7 @@ FMCPResponse Tool_GetPerceivedActors(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor));
 	Out->SetArrayField(TEXT("perceived"), Items);
 	Out->SetNumberField(TEXT("total"), Items.Num());
-	return AIPER_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ─────────────────────────────────────────────────────────────────────────────

@@ -3,6 +3,7 @@
 #include "AIBlackboardTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
 
@@ -34,7 +35,6 @@ namespace
 {
 	// AIBB_ prefix per the unity-build symbol-collision pattern (see PackageTools / PhysicsTools
 	// notes — every Tools/*.cpp must use a unique prefix because the plugin builds unity-style).
-	constexpr int32 kAIBBErrorInvalidParams   = -32602;
 	constexpr int32 kAIBBErrorInternal        = -32603;
 	constexpr int32 kAIBBErrorObjectNotFound  = kMCPErrorObjectNotFound;     // -32004
 	constexpr int32 kAIBBErrorKeyNotFound     = kMCPErrorPropertyNotFound;   // -32005
@@ -47,48 +47,6 @@ namespace
 	// Wire type-string for unknown subclasses retains the "BlackboardKeyType_" prefix so the
 	// caller can identify the raw subclass. Recognised subclasses strip it.
 	const TCHAR* const kAIBBTypePrefix = TEXT("BlackboardKeyType_");
-
-	void AIBB_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse AIBB_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		AIBB_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse AIBB_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		AIBB_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
-	bool AIBB_RequireStringField(const FMCPRequest& Request, const TCHAR* FieldName,
-		FString& OutValue, FMCPResponse& OutError)
-	{
-		if (!Request.Args.IsValid())
-		{
-			OutError = AIBB_MakeError(Request, kAIBBErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetStringField(FieldName, OutValue) || OutValue.IsEmpty())
-		{
-			OutError = AIBB_MakeError(Request, kAIBBErrorInvalidParams,
-				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
-			return false;
-		}
-		return true;
-	}
 
 	/**
 	 * Resolve the actor (Pawn OR AIController) referenced by ``actor_path`` and return the
@@ -115,7 +73,7 @@ namespace
 			// Disambiguate "not found" from "path malformed" via the underlying error text. The
 			// parser sets bIsFullPath/ActorName fields in OutParts but the friendlier signal is in
 			// ResolveErr — we forward it raw so the caller sees the exact failure.
-			OutError = AIBB_MakeError(Request, kAIBBErrorObjectNotFound,
+			OutError = FMCPToolHelpers::MakeError(Request, kAIBBErrorObjectNotFound,
 				bAmbiguous
 					? FString::Printf(TEXT("actor '%s' is ambiguous; candidates: %s"),
 						*ActorPath, *AmbiguityHint)
@@ -135,7 +93,7 @@ namespace
 		}
 		if (!AIC)
 		{
-			OutError = AIBB_MakeError(Request, kAIBBErrorObjectNotFound,
+			OutError = FMCPToolHelpers::MakeError(Request, kAIBBErrorObjectNotFound,
 				FString::Printf(TEXT("actor '%s' has no AIController (expected APawn with AAIController, "
 					"or a direct AAIController path)"), *ActorPath));
 			return nullptr;
@@ -144,7 +102,7 @@ namespace
 		UBlackboardComponent* BB = AIC->GetBlackboardComponent();
 		if (!BB)
 		{
-			OutError = AIBB_MakeError(Request, kAIBBErrorObjectNotFound,
+			OutError = FMCPToolHelpers::MakeError(Request, kAIBBErrorObjectNotFound,
 				FString::Printf(TEXT("AIController on actor '%s' has no UBlackboardComponent "
 					"(behaviour tree not running, or no blackboard asset assigned)"), *ActorPath));
 			return nullptr;
@@ -594,7 +552,7 @@ FMCPResponse Tool_ListKeys(const FMCPRequest& Request)
 
 	FString ActorPath;
 	FMCPResponse Err;
-	if (!AIBB_RequireStringField(Request, TEXT("actor_path"), ActorPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("actor_path"), ActorPath, Err)) { return Err; }
 
 	UBlackboardComponent* BB = AIBB_ResolveBlackboard(Request, ActorPath, Err);
 	if (!BB) { return Err; }
@@ -602,7 +560,7 @@ FMCPResponse Tool_ListKeys(const FMCPRequest& Request)
 	UBlackboardData* Data = BB->GetBlackboardAsset();
 	if (!Data)
 	{
-		return AIBB_MakeError(Request, kAIBBErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kAIBBErrorInternal,
 			FString::Printf(TEXT("blackboard component on actor '%s' has no BlackboardAsset "
 				"(behaviour tree never initialised?)"), *ActorPath));
 	}
@@ -622,7 +580,7 @@ FMCPResponse Tool_ListKeys(const FMCPRequest& Request)
 	Out->SetArrayField(TEXT("keys"), KeysArr);
 	Out->SetNumberField(TEXT("total"), KeysArr.Num());
 	Out->SetStringField(TEXT("actor_path"), ActorPath);
-	return AIBB_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── ai.bb.get_value ───────────────────────────────────────────────────────────────────────────
@@ -645,8 +603,8 @@ FMCPResponse Tool_GetValue(const FMCPRequest& Request)
 	FString ActorPath;
 	FString KeyName;
 	FMCPResponse Err;
-	if (!AIBB_RequireStringField(Request, TEXT("actor_path"), ActorPath, Err)) { return Err; }
-	if (!AIBB_RequireStringField(Request, TEXT("key_name"), KeyName, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("actor_path"), ActorPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("key_name"), KeyName, Err)) { return Err; }
 
 	UBlackboardComponent* BB = AIBB_ResolveBlackboard(Request, ActorPath, Err);
 	if (!BB) { return Err; }
@@ -657,7 +615,7 @@ FMCPResponse Tool_GetValue(const FMCPRequest& Request)
 	const FBlackboard::FKey KeyId = BB->GetKeyID(KeyFName);
 	if (KeyId == FBlackboard::InvalidKey)
 	{
-		return AIBB_MakeError(Request, kAIBBErrorKeyNotFound,
+		return FMCPToolHelpers::MakeError(Request, kAIBBErrorKeyNotFound,
 			FString::Printf(TEXT("blackboard on actor '%s' has no key '%s'"), *ActorPath, *KeyName));
 	}
 
@@ -692,7 +650,7 @@ FMCPResponse Tool_GetValue(const FMCPRequest& Request)
 	}
 	if (!KeyType)
 	{
-		return AIBB_MakeError(Request, kAIBBErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kAIBBErrorInternal,
 			FString::Printf(TEXT("blackboard on actor '%s' has key '%s' in component but no entry in "
 				"asset Keys[] or ParentKeys[] (corrupt asset?)"), *ActorPath, *KeyName));
 	}
@@ -718,7 +676,7 @@ FMCPResponse Tool_GetValue(const FMCPRequest& Request)
 	{
 		Out->SetField(TEXT("value"), TypedValue);
 	}
-	return AIBB_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── ai.bb.set_value ───────────────────────────────────────────────────────────────────────────
@@ -743,20 +701,20 @@ FMCPResponse Tool_SetValue(const FMCPRequest& Request)
 	FString ActorPath;
 	FString KeyName;
 	FMCPResponse Err;
-	if (!AIBB_RequireStringField(Request, TEXT("actor_path"), ActorPath, Err)) { return Err; }
-	if (!AIBB_RequireStringField(Request, TEXT("key_name"), KeyName, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("actor_path"), ActorPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("key_name"), KeyName, Err)) { return Err; }
 
 	// "value" must be present even when its JSON type is null (callers explicitly clearing an
 	// Object/Class key). HasField + GetField distinguishes "absent" (-32602) from "present null".
 	if (!Request.Args.IsValid() || !Request.Args->HasField(TEXT("value")))
 	{
-		return AIBB_MakeError(Request, kAIBBErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required field 'value' (use JSON null to clear Object/Class keys)"));
 	}
 	const TSharedPtr<FJsonValue> ValueField = Request.Args->TryGetField(TEXT("value"));
 	if (!ValueField.IsValid())
 	{
-		return AIBB_MakeError(Request, kAIBBErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("required field 'value' could not be parsed"));
 	}
 
@@ -767,7 +725,7 @@ FMCPResponse Tool_SetValue(const FMCPRequest& Request)
 	const FBlackboard::FKey KeyId = BB->GetKeyID(KeyFName);
 	if (KeyId == FBlackboard::InvalidKey)
 	{
-		return AIBB_MakeError(Request, kAIBBErrorKeyNotFound,
+		return FMCPToolHelpers::MakeError(Request, kAIBBErrorKeyNotFound,
 			FString::Printf(TEXT("blackboard on actor '%s' has no key '%s'"), *ActorPath, *KeyName));
 	}
 
@@ -787,7 +745,7 @@ FMCPResponse Tool_SetValue(const FMCPRequest& Request)
 	}
 	if (!KeyType)
 	{
-		return AIBB_MakeError(Request, kAIBBErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kAIBBErrorInternal,
 			FString::Printf(TEXT("blackboard on actor '%s' has key '%s' but no key-type entry in "
 				"asset (corrupt asset?)"), *ActorPath, *KeyName));
 	}
@@ -803,7 +761,7 @@ FMCPResponse Tool_SetValue(const FMCPRequest& Request)
 	FString SetErr;
 	if (!AIBB_SetTypedValue(*BB, KeyType, KeyFName, ValueField, SetErr))
 	{
-		return AIBB_MakeError(Request, kAIBBErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			FString::Printf(TEXT("set rejected for key '%s' (type '%s'): %s"),
 				*KeyName, *TypeName, *SetErr));
 	}
@@ -815,7 +773,7 @@ FMCPResponse Tool_SetValue(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("actor_path"), ActorPath);
 	Out->SetField(TEXT("prior_value"), PriorValue.IsValid() ? PriorValue : MakeShared<FJsonValueNull>());
 	Out->SetStringField(TEXT("prior_value_repr"), PriorRepr);
-	return AIBB_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ─────────────────────────────────────────────────────────────────────────────
