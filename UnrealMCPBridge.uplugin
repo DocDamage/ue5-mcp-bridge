@@ -17,6 +17,11 @@
 	"EnabledByDefault": true,
 	"Modules": [
 		{
+			"Name": "UnrealMCPBridgeCore",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		},
+		{
 			"Name": "UnrealMCPBridge",
 			"Type": "Editor",
 			"LoadingPhase": "Default"

@@ -33,6 +33,10 @@ public class UnrealMCPBridge : ModuleRules
 				"InputCore",
 				"Json",
 				"JsonUtilities",
+				// Phase 5 module split (2026-05-22) — sister module owning server + helpers + utils.
+				// Public dep so Tools surfaces transparently see Core's Public/ headers
+				// (MCPToolHelpers, MCPAssetLoader, MCPMutatorScope, MCPJsonBuilder, Utils/*).
+				"UnrealMCPBridgeCore",
 			}
 		);
 

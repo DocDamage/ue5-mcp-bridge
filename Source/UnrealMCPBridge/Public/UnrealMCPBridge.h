@@ -6,7 +6,9 @@
 #include "Modules/ModuleInterface.h"
 #include "Modules/ModuleManager.h"
 
-DECLARE_LOG_CATEGORY_EXTERN(LogMCP, Log, All);
+// Phase 5 module split (2026-05-22): LogMCP moved to UnrealMCPBridgeCore's MCPTypes.h to break the
+// Core → Tools include cycle. Surfaces + module class can include "MCPTypes.h" for the log category.
+#include "MCPTypes.h"
 
 /**
  * Public module interface for the Unreal MCP Bridge.
