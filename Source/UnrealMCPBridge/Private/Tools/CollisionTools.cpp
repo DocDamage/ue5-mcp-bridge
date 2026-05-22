@@ -23,6 +23,13 @@ namespace
 	constexpr int32 kCOLLErrorInternal        = -32603;
 	constexpr int32 kCOLLErrorObjectNotFound  = kMCPErrorObjectNotFound; // -32004
 
+	// Phase 4.2-final (2026-05-22): module-scoped lock serialising Lane B reads vs Lane A write.
+	// UCollisionProfile::Get() returns a singleton whose `Profiles` TArray is mutated by
+	// `set_profile_response` (Lane A) — concurrent Lane B reads (list_channels / list_profiles /
+	// get_profile) would race the iteration if a writer is mid-mutation. All 4 tools must acquire
+	// this lock; readers can do it briefly, writer holds it for the full mutation block.
+	FCriticalSection gCollisionProfileLock;
+
 	/** Map ECollisionResponse → wire string. */
 	const TCHAR* COLL_ResponseToString(ECollisionResponse Response)
 	{
@@ -172,7 +179,8 @@ namespace FCollisionTools
 // UCollisionProfile::ConvertToTraceType / ConvertToObjectType.
 FMCPResponse Tool_ListChannels(const FMCPRequest& Request)
 {
-	check(IsInGameThread());
+	// Phase 4.2-final: Lane B with gCollisionProfileLock serializing readers vs Lane A writer.
+	FScopeLock Lock(&gCollisionProfileLock);
 
 	const UCollisionProfile* CP = UCollisionProfile::Get();
 	if (!CP)
@@ -217,7 +225,8 @@ FMCPResponse Tool_ListChannels(const FMCPRequest& Request)
 // always present in editor builds where this tool runs).
 FMCPResponse Tool_ListProfiles(const FMCPRequest& Request)
 {
-	check(IsInGameThread());
+	// Phase 4.2-final: Lane B with gCollisionProfileLock serializing readers vs Lane A writer.
+	FScopeLock Lock(&gCollisionProfileLock);
 
 	const UCollisionProfile* CP = UCollisionProfile::Get();
 	if (!CP)
@@ -268,7 +277,8 @@ FMCPResponse Tool_ListProfiles(const FMCPRequest& Request)
 // emits ONE entry per registered channel (skips unregistered slots).
 FMCPResponse Tool_GetProfile(const FMCPRequest& Request)
 {
-	check(IsInGameThread());
+	// Phase 4.2-final: Lane B with gCollisionProfileLock serializing readers vs Lane A writer.
+	FScopeLock Lock(&gCollisionProfileLock);
 
 	FString ProfileNameStr;
 	FMCPResponse Err;
@@ -332,6 +342,11 @@ FMCPResponse Tool_GetProfile(const FMCPRequest& Request)
 FMCPResponse Tool_SetProfileResponse(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
+	// Phase 4.2-final: writer also acquires gCollisionProfileLock to serialize with Lane B readers
+	// (list_channels / list_profiles / get_profile). Lock is held for the FULL mutation block —
+	// including the TryUpdateDefaultConfigFile + LoadProfileConfig reload — so concurrent readers
+	// see either fully-old or fully-new state, never a torn intermediate.
+	FScopeLock Lock(&gCollisionProfileLock);
 
 	FString ProfileNameStr, ChannelNameStr, ResponseStr;
 	FMCPResponse Err;
@@ -451,9 +466,12 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 		OutRegisteredMethodNames.Add(MethodName);
 	};
 
-	RegisterTool(TEXT("collision.list_channels"),        &Tool_ListChannels,        /*Lane A*/ false);
-	RegisterTool(TEXT("collision.list_profiles"),        &Tool_ListProfiles,        /*Lane A*/ false);
-	RegisterTool(TEXT("collision.get_profile"),          &Tool_GetProfile,          /*Lane A*/ false);
+	// Phase 4.2-final (2026-05-22): 3 readers promoted to Lane B with gCollisionProfileLock
+	// serializing them vs the Lane A writer. set_profile_response stays Lane A — its mutation
+	// block uses FScopedTransaction + TryUpdateDefaultConfigFile (disk write) which require GT.
+	RegisterTool(TEXT("collision.list_channels"),        &Tool_ListChannels,        /*Lane B*/ true);
+	RegisterTool(TEXT("collision.list_profiles"),        &Tool_ListProfiles,        /*Lane B*/ true);
+	RegisterTool(TEXT("collision.get_profile"),          &Tool_GetProfile,          /*Lane B*/ true);
 	RegisterTool(TEXT("collision.set_profile_response"), &Tool_SetProfileResponse,  /*Lane A*/ false);
 
 	UE_LOG(LogMCP, Log,

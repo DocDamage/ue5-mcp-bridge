@@ -29,6 +29,14 @@ namespace
 	// from MCPToolHelpers.h.
 	constexpr int32 kTSTErrorInvalidParams = -32602;
 
+	// Phase 4.2-final (2026-05-22): module-scoped lock serializing Lane B readers vs Lane A
+	// writers on FAutomationTestFramework state. The framework's TestInfo map + RequestedTestFilter
+	// + CurrentTest pointer are mutated by run_single_test / cancel_current / set_filter_flags
+	// (Lane A) and read by list_automation_specs / list_categories / get_test_info / get_last_results
+	// (now Lane B). Without this lock, Lane B readers would torn-read RequestedTestFilter or race
+	// the CurrentTest pointer transitions.
+	FCriticalSection gAutomationFrameworkLock;
+
 	// Wall-clock cap for the sync ``test.run_single_test`` path. Smoke tests routinely complete
 	// well under 1s; anything over this should be invoked via ``test.run_automation`` (async,
 	// pollable, no wall-clock cap). 30s is generous enough for "small product tests" while still
@@ -306,7 +314,8 @@ namespace FTestTools
 // unregister mid-pagination (rare; would also affect the page_token validity in practice).
 FMCPResponse Tool_ListAutomationSpecs(const FMCPRequest& Request)
 {
-	check(IsInGameThread());
+	// Phase 4.2-final: Lane B with gAutomationFrameworkLock serializing reader vs Lane A writers.
+	FScopeLock Lock(&gAutomationFrameworkLock);
 
 	FString Filter;
 	if (Request.Args.IsValid())
@@ -425,6 +434,11 @@ FMCPResponse Tool_ListAutomationSpecs(const FMCPRequest& Request)
 FMCPResponse Tool_RunSingleTest(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
+	// Phase 4.2-final: writer holds gAutomationFrameworkLock for the FULL StartTestByName +
+	// ExecuteLatentCommands + StopTest block (up to kMaxRunTimeSeconds = 30s). Lane B readers
+	// poll this lock and queue up while a test is running — acceptable since the alternative is
+	// torn reads of the framework's CurrentTest pointer / RequestedTestFilter field.
+	FScopeLock Lock(&gAutomationFrameworkLock);
 
 	if (!Request.Args.IsValid())
 	{
@@ -529,7 +543,8 @@ FMCPResponse Tool_RunSingleTest(const FMCPRequest& Request)
 // rolling buffer the framework keeps for us.)
 FMCPResponse Tool_GetLastResults(const FMCPRequest& Request)
 {
-	check(IsInGameThread());
+	// Phase 4.2-final: Lane B with gAutomationFrameworkLock.
+	FScopeLock Lock(&gAutomationFrameworkLock);
 
 	FAutomationTestFramework& Framework = FAutomationTestFramework::Get();
 	FAutomationTestBase* Current = Framework.GetCurrentTest();
@@ -587,6 +602,9 @@ FMCPResponse Tool_GetLastResults(const FMCPRequest& Request)
 FMCPResponse Tool_CancelCurrent(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
+	// Phase 4.2-final: writer locks framework state — must wait for any in-flight run_single_test
+	// to release. Acceptable: cancel is a rare operator action.
+	FScopeLock Lock(&gAutomationFrameworkLock);
 
 	FAutomationTestFramework& Framework = FAutomationTestFramework::Get();
 	FAutomationTestBase* Current = Framework.GetCurrentTest();
@@ -626,7 +644,8 @@ FMCPResponse Tool_CancelCurrent(const FMCPRequest& Request)
 // individual tests).
 FMCPResponse Tool_ListCategories(const FMCPRequest& Request)
 {
-	check(IsInGameThread());
+	// Phase 4.2-final: Lane B with gAutomationFrameworkLock.
+	FScopeLock Lock(&gAutomationFrameworkLock);
 
 	TArray<FAutomationTestInfo> AllTests;
 	FAutomationTestFramework::Get().GetValidTestNames(AllTests);
@@ -679,7 +698,8 @@ FMCPResponse Tool_ListCategories(const FMCPRequest& Request)
 //   -32046 TestNotFound     no test with this FullTestPath in the registered set
 FMCPResponse Tool_GetTestInfo(const FMCPRequest& Request)
 {
-	check(IsInGameThread());
+	// Phase 4.2-final: Lane B with gAutomationFrameworkLock.
+	FScopeLock Lock(&gAutomationFrameworkLock);
 
 	if (!Request.Args.IsValid())
 	{
@@ -723,7 +743,9 @@ FMCPResponse Tool_GetTestInfo(const FMCPRequest& Request)
 // filtered. (We do NOT auto-reset on next call — that would surprise tooling.)
 FMCPResponse Tool_SetFilterFlags(const FMCPRequest& Request)
 {
-	check(IsInGameThread());
+	// Phase 4.2-final: writer holds gAutomationFrameworkLock — serializes against Lane B readers
+	// of RequestedTestFilter (which is a plain enum field with no internal atomic protection).
+	FScopeLock Lock(&gAutomationFrameworkLock);
 
 	if (!Request.Args.IsValid())
 	{
@@ -787,12 +809,18 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 		OutRegisteredMethodNames.Add(MethodName);
 	};
 
-	RegisterTool(TEXT("test.list_automation_specs"), &Tool_ListAutomationSpecs, /*Lane A*/ false);
+	// Phase 4.2-final (2026-05-22): 4 readers promoted to Lane B with gAutomationFrameworkLock
+	// serializing them vs Lane A writers (run_single_test / cancel_current / set_filter_flags).
+	// run_single_test / cancel_current stay Lane A — they call StartTestByName /
+	// ExecuteLatentCommands / StopTest which invoke ProcessEvent on UObject test bodies (GT-only).
+	// set_filter_flags stays Lane A — conservative; writes a framework field affecting test
+	// invocation behavior; cleanest to keep on GT alongside the invocation paths.
+	RegisterTool(TEXT("test.list_automation_specs"), &Tool_ListAutomationSpecs, /*Lane B*/ true);
 	RegisterTool(TEXT("test.run_single_test"),       &Tool_RunSingleTest,       /*Lane A*/ false);
-	RegisterTool(TEXT("test.get_last_results"),      &Tool_GetLastResults,      /*Lane A*/ false);
+	RegisterTool(TEXT("test.get_last_results"),      &Tool_GetLastResults,      /*Lane B*/ true);
 	RegisterTool(TEXT("test.cancel_current"),        &Tool_CancelCurrent,       /*Lane A*/ false);
-	RegisterTool(TEXT("test.list_categories"),       &Tool_ListCategories,      /*Lane A*/ false);
-	RegisterTool(TEXT("test.get_test_info"),         &Tool_GetTestInfo,         /*Lane A*/ false);
+	RegisterTool(TEXT("test.list_categories"),       &Tool_ListCategories,      /*Lane B*/ true);
+	RegisterTool(TEXT("test.get_test_info"),         &Tool_GetTestInfo,         /*Lane B*/ true);
 	RegisterTool(TEXT("test.set_filter_flags"),      &Tool_SetFilterFlags,      /*Lane A*/ false);
 
 	UE_LOG(LogMCP, Log,
