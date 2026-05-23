@@ -66,8 +66,20 @@ namespace FAIBlackboardTools
 {
 	UNREALMCPBRIDGE_API void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames);
 
-	// Wave J Surface 2: ai.bb.* tools.
+	// Wave J Surface 2: ai.bb.* tools (runtime read/write).
 	UNREALMCPBRIDGE_API FMCPResponse Tool_ListKeys(const FMCPRequest& Request);
 	UNREALMCPBRIDGE_API FMCPResponse Tool_GetValue(const FMCPRequest& Request);
 	UNREALMCPBRIDGE_API FMCPResponse Tool_SetValue(const FMCPRequest& Request);
+
+	// Wave P: ai.bb.* authoring (UBlackboardData asset + Keys[] CRUD).
+	// create_asset    NewObject<UBlackboardData> + optional Parent BB link
+	// add_key         FBlackboardEntry + NewObject<UBlackboardKeyType_X>; short-name resolution
+	//                 Bool/Int/Float/String/Name/Vector/Rotator/Class/Object/Enum.
+	//                 Class/Object use key_options.base_class; Enum uses key_options.enum_path.
+	// remove_key      Match by EntryName; idempotent (returns removed=false if absent).
+	// (set_key_default DROPPED for v1 — BB defaults use per-type binary serialization that doesn't
+	// round-trip cleanly; callers use runtime ai.bb.set_value instead.)
+	UNREALMCPBRIDGE_API FMCPResponse Tool_CreateAsset(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_AddKey(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_RemoveKey(const FMCPRequest& Request);
 }

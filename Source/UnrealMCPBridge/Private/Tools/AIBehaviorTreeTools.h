@@ -69,8 +69,40 @@ namespace FAIBehaviorTreeTools
 {
 	UNREALMCPBRIDGE_API void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames);
 
+	// Wave J Surface 1: ai.bt.* (inspection + runtime control).
 	UNREALMCPBRIDGE_API FMCPResponse Tool_ListAssets(const FMCPRequest& Request);
 	UNREALMCPBRIDGE_API FMCPResponse Tool_GetNodes(const FMCPRequest& Request);
 	UNREALMCPBRIDGE_API FMCPResponse Tool_StartOnActor(const FMCPRequest& Request);
 	UNREALMCPBRIDGE_API FMCPResponse Tool_StopOnActor(const FMCPRequest& Request);
+
+	// Wave P: ai.bt.* authoring (asset + tree-structure CRUD).
+	//
+	// **Path syntax** (dotted/bracket): "Root", "Root/Children[N]", "Root/Children[N]/Decorators[M]",
+	// "Root/Decorators[M]", "Root/Services[M]", "Root/Children[N]/Services[M]". Resolver walks the
+	// runtime tree (BTGraph editor visualization is NOT updated — editor must re-open to see changes;
+	// runtime behaviour is correct).
+	//
+	// **Limitations (v1):**
+	//   - Single-decorator only — RootDecoratorOps[] / DecoratorOps[] (FBTDecoratorLogic AND/OR/NOT)
+	//     not exposed. Multi-decorator combinations stay at engine default (Test-only — single
+	//     decorator gates child execution).
+	//   - BT editor graph desync — runtime tree mutations bypass UEdGraph. Re-open editor tab.
+	//
+	// **Error codes (all reused):**
+	//   -32004 ObjectNotFound      bt_path / blackboard_asset_path not loadable
+	//   -32010 InvalidPath         asset path malformed
+	//   -32011 WrongClass          node_class/decorator_class/service_class is not the right family;
+	//                              OR add_decorator/add_service target is decorator/service slot
+	//   -32014 PathInUse           create_asset target already exists
+	//   -32020 ClassNotFound       class_path did not resolve
+	//   -32023 InvalidClassPath    class_path malformed
+	//   -32027 PIEActive
+	//   -32602 InvalidParams       node_path / parent_path malformed; missing required args
+	//   -32603 InternalError       CreatePackage / NewObject failed
+	UNREALMCPBRIDGE_API FMCPResponse Tool_CreateAsset(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_AddNode(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_AddDecorator(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_AddService(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_RemoveNode(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_SetNodeProperty(const FMCPRequest& Request);
 }

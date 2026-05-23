@@ -3,12 +3,16 @@
 #include "AIBlackboardTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPAssetLoader.h"
 #include "MCPJsonBuilder.h"
+#include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
+#include "Utils/MCPAssetPathUtils.h"
 
 #include "AIController.h"
+#include "AssetRegistry/AssetRegistryModule.h"
 #include "BehaviorTree/BlackboardComponent.h"
 #include "BehaviorTree/BlackboardData.h"
 #include "BehaviorTree/Blackboard/BlackboardKeyType.h"
@@ -24,8 +28,12 @@
 #include "BehaviorTree/Blackboard/BlackboardKeyType_Vector.h"
 #include "GameFramework/Actor.h"
 #include "GameFramework/Pawn.h"
+#include "Misc/PackageName.h"
+#include "Misc/Paths.h"
 #include "UObject/Class.h"
 #include "UObject/Object.h"
+#include "UObject/Package.h"
+#include "UObject/UnrealType.h"
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -530,6 +538,29 @@ namespace
 		return false;
 	}
 
+	// ─── Wave P authoring helpers ──────────────────────────────────────────────────────────────────
+
+	/**
+	 * Wave P: map a short key-type name ("Bool", "Int", "Float", "String", "Name", "Vector",
+	 * "Rotator", "Class", "Object", "Enum") to the UBlackboardKeyType_X UClass. Returns nullptr for
+	 * unknown short names — caller surfaces -32602. The accepted set mirrors the friendly-name set
+	 * used by ai.bb.list_keys / ai.bb.get_value so the round-trip is symmetric.
+	 */
+	UClass* AIBB_KeyTypeShortNameToClass(const FString& ShortName)
+	{
+		if (ShortName.Equals(TEXT("Bool"),    ESearchCase::IgnoreCase)) { return UBlackboardKeyType_Bool   ::StaticClass(); }
+		if (ShortName.Equals(TEXT("Int"),     ESearchCase::IgnoreCase)) { return UBlackboardKeyType_Int    ::StaticClass(); }
+		if (ShortName.Equals(TEXT("Float"),   ESearchCase::IgnoreCase)) { return UBlackboardKeyType_Float  ::StaticClass(); }
+		if (ShortName.Equals(TEXT("String"),  ESearchCase::IgnoreCase)) { return UBlackboardKeyType_String ::StaticClass(); }
+		if (ShortName.Equals(TEXT("Name"),    ESearchCase::IgnoreCase)) { return UBlackboardKeyType_Name   ::StaticClass(); }
+		if (ShortName.Equals(TEXT("Vector"),  ESearchCase::IgnoreCase)) { return UBlackboardKeyType_Vector ::StaticClass(); }
+		if (ShortName.Equals(TEXT("Rotator"), ESearchCase::IgnoreCase)) { return UBlackboardKeyType_Rotator::StaticClass(); }
+		if (ShortName.Equals(TEXT("Class"),   ESearchCase::IgnoreCase)) { return UBlackboardKeyType_Class  ::StaticClass(); }
+		if (ShortName.Equals(TEXT("Object"),  ESearchCase::IgnoreCase)) { return UBlackboardKeyType_Object ::StaticClass(); }
+		if (ShortName.Equals(TEXT("Enum"),    ESearchCase::IgnoreCase)) { return UBlackboardKeyType_Enum   ::StaticClass(); }
+		return nullptr;
+	}
+
 } // namespace
 
 namespace FAIBlackboardTools
@@ -780,6 +811,317 @@ FMCPResponse Tool_SetValue(const FMCPRequest& Request)
 		.BuildSuccess(Request);
 }
 
+// ─── ai.bb.create_asset (Wave P) ───────────────────────────────────────────────────────────────
+//
+// Args:    { path: string, parent_bb?: string }
+// Result:  { asset_path, has_parent }
+//
+// Creates a new UBlackboardData asset at the supplied /Game/... path. Optional ``parent_bb``
+// path sets the inheritance link (BB->Parent) so child keys merge with parent keys at runtime.
+//
+// Pattern: CreatePackage + NewObject<UBlackboardData> + FAssetRegistryModule::AssetCreated +
+// Scope.DirtyPackage. Caller saves explicitly via cb.save / asset.save_loaded (not auto-saved
+// here — matches anim.create_montage / asset.create_data_asset convention).
+//
+// Errors:
+//   -32010 InvalidPath        path malformed / unknown mount
+//   -32014 PathInUse          path already exists on disk
+//   -32004 ObjectNotFound     parent_bb supplied but not loadable / wrong class
+//   -32027 PIEActive          PIE running
+//   -32603 InternalError      CreatePackage / NewObject returned null
+FMCPResponse Tool_CreateAsset(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_BBCreateAsset", "Create Blackboard Asset"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
+
+	FString DestPathRaw;
+	FMCPResponse Err;
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("path"), DestPathRaw, Err)) { return Err; }
+
+	const FString DestPathNorm = FMCPAssetPathUtils::Normalize(DestPathRaw);
+	if (DestPathNorm.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(DestPathNorm))
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
+			FString::Printf(TEXT("path '%s' malformed or unknown mount"), *DestPathRaw));
+	}
+
+	const FString PackagePath = FPaths::GetPath(DestPathNorm);
+	const FString AssetName   = FPaths::GetBaseFilename(DestPathNorm);
+
+	if (FPackageName::DoesPackageExist(DestPathNorm) ||
+		FindObject<UObject>(nullptr, *(DestPathNorm + TEXT(".") + AssetName)) != nullptr)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
+			FString::Printf(TEXT("path '%s' already exists"), *DestPathNorm));
+	}
+
+	// Optional parent_bb resolution — must come BEFORE NewObject so we can fail-fast.
+	UBlackboardData* ParentBB = nullptr;
+	FString ParentBBPath;
+	if (Request.Args.IsValid() && Request.Args->TryGetStringField(TEXT("parent_bb"), ParentBBPath)
+		&& !ParentBBPath.IsEmpty())
+	{
+		int32 LoadErr = 0;
+		FString LoadMsg;
+		ParentBB = FMCPAssetLoader::Load<UBlackboardData>(ParentBBPath, LoadErr, LoadMsg);
+		if (!ParentBB) { return FMCPToolHelpers::MakeError(Request, LoadErr, LoadMsg); }
+	}
+
+	UPackage* BBPkg = CreatePackage(*DestPathNorm);
+	if (!BBPkg)
+	{
+		return FMCPToolHelpers::MakeError(Request, kAIBBErrorInternal,
+			FString::Printf(TEXT("CreatePackage returned null for '%s'"), *DestPathNorm));
+	}
+	BBPkg->FullyLoad();
+
+	UBlackboardData* BB = NewObject<UBlackboardData>(
+		BBPkg, *AssetName, RF_Public | RF_Standalone | RF_Transactional);
+	if (!BB)
+	{
+		return FMCPToolHelpers::MakeError(Request, kAIBBErrorInternal,
+			FString::Printf(TEXT("NewObject<UBlackboardData> returned null for '%s'"), *DestPathNorm));
+	}
+
+	if (ParentBB) { BB->Parent = ParentBB; }
+
+	FAssetRegistryModule::AssetCreated(BB);
+	Scope.DirtyPackage(BBPkg);
+
+	return FMCPJsonBuilder()
+		.Str (TEXT("asset_path"), BB->GetPathName())
+		.Bool(TEXT("has_parent"), ParentBB != nullptr)
+		.OptStr(TEXT("parent_path"), ParentBB ? ParentBB->GetPathName() : FString())
+		.BuildSuccess(Request);
+}
+
+// ─── ai.bb.add_key (Wave P) ────────────────────────────────────────────────────────────────────
+//
+// Args:    { bb_path: string, key_name: string, key_type: string,
+//            key_options?: { base_class?: string, enum_path?: string },
+//            instance_synced?: bool (default false) }
+// Result:  { added, key_name, key_type, key_index }
+//
+// key_type is the short-name form ("Bool" / "Int" / "Float" / "String" / "Name" / "Vector" /
+// "Rotator" / "Class" / "Object" / "Enum"), matching ai.bb.list_keys' wire shape.
+//
+// For Class / Object key types: ``key_options.base_class`` sets the UBlackboardKeyType_X->BaseClass
+// constraint (filters which classes/objects can be assigned at runtime).
+// For Enum key type: ``key_options.enum_path`` sets EnumType (e.g. "/Script/MyGame.EAlertLevel").
+//
+// **DEFAULT VALUES NOT SUPPORTED IN v1.** Default values live in per-type binary serialization
+// (UBlackboardKeyType_X stores them in subclass-specific fields). Callers use ai.bb.set_value at
+// runtime to set initial values per-instance instead.
+//
+// Errors:
+//   -32602 InvalidParams       missing args / unknown key_type / key_name collision in args
+//   -32005 PropertyNotFound    key_name already exists on BB (KeyNotFound code reused as duplicate)
+//   -32004 ObjectNotFound      bb_path not loadable / base_class / enum_path not loadable
+//   -32027 PIEActive
+FMCPResponse Tool_AddKey(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_BBAddKey", "Add Blackboard Key"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
+
+	FString BBPath, KeyName, KeyType;
+	FMCPResponse Err;
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("bb_path"),  BBPath,  Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("key_name"), KeyName, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("key_type"), KeyType, Err)) { return Err; }
+
+	int32 LoadErr = 0;
+	FString LoadMsg;
+	UBlackboardData* BB = FMCPAssetLoader::Load<UBlackboardData>(BBPath, LoadErr, LoadMsg);
+	if (!BB) { return FMCPToolHelpers::MakeError(Request, LoadErr, LoadMsg); }
+
+	UClass* KeyClass = AIBB_KeyTypeShortNameToClass(KeyType);
+	if (!KeyClass)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
+			FString::Printf(TEXT("unknown key_type '%s' (expected one of Bool/Int/Float/String/Name/"
+				"Vector/Rotator/Class/Object/Enum)"), *KeyType));
+	}
+
+	// Duplicate-name check: scan BB->Keys (parent keys are looked up separately at runtime; we only
+	// guard against duplicates within THIS asset's own Keys[] list, matching engine semantics where
+	// a child can legally override an inherited parent key — but cannot have two same-named in itself).
+	const FName KeyFName(*KeyName);
+	for (const FBlackboardEntry& Existing : BB->Keys)
+	{
+		if (Existing.EntryName == KeyFName)
+		{
+			return FMCPToolHelpers::MakeError(Request, kAIBBErrorKeyNotFound,
+				FString::Printf(TEXT("blackboard '%s' already has a key named '%s'; remove first via "
+					"ai.bb.remove_key or pick a unique name"), *BB->GetPathName(), *KeyName));
+		}
+	}
+
+	// Pre-validate key_options before mutating asset state so a bad sub-arg doesn't leak a half-
+	// constructed Keys[] entry into the BB.
+	const TSharedPtr<FJsonObject>* OptionsObj = nullptr;
+	const bool bHasOptions = Request.Args.IsValid()
+		&& Request.Args->TryGetObjectField(TEXT("key_options"), OptionsObj)
+		&& OptionsObj && (*OptionsObj).IsValid();
+
+	UClass* OptionalBaseClass = nullptr;
+	UEnum*  OptionalEnumType  = nullptr;
+	if (bHasOptions)
+	{
+		FString BaseClassPath;
+		if ((*OptionsObj)->TryGetStringField(TEXT("base_class"), BaseClassPath) && !BaseClassPath.IsEmpty())
+		{
+			// Only meaningful for Class / Object key types.
+			if (KeyClass != UBlackboardKeyType_Class::StaticClass()
+				&& KeyClass != UBlackboardKeyType_Object::StaticClass())
+			{
+				return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
+					FString::Printf(TEXT("key_options.base_class is only valid for Class or Object "
+						"key types (got '%s')"), *KeyType));
+			}
+			OptionalBaseClass = LoadClass<UObject>(nullptr, *BaseClassPath);
+			if (!OptionalBaseClass)
+			{
+				return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+					FString::Printf(TEXT("key_options.base_class '%s' did not resolve to a UClass"),
+						*BaseClassPath));
+			}
+		}
+
+		FString EnumPath;
+		if ((*OptionsObj)->TryGetStringField(TEXT("enum_path"), EnumPath) && !EnumPath.IsEmpty())
+		{
+			if (KeyClass != UBlackboardKeyType_Enum::StaticClass())
+			{
+				return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
+					FString::Printf(TEXT("key_options.enum_path is only valid for Enum key type "
+						"(got '%s')"), *KeyType));
+			}
+			OptionalEnumType = LoadObject<UEnum>(nullptr, *EnumPath);
+			if (!OptionalEnumType)
+			{
+				return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+					FString::Printf(TEXT("key_options.enum_path '%s' did not resolve to a UEnum"),
+						*EnumPath));
+			}
+		}
+	}
+
+	// Construct the key type instance owned by the BB asset (matches engine pattern in
+	// UBlackboardData::UpdatePersistentKey — KeyType is Instanced and owned by the asset).
+	UBlackboardKeyType* NewKT = NewObject<UBlackboardKeyType>(
+		BB, KeyClass, NAME_None, RF_Public | RF_Transactional);
+	check(NewKT);
+
+	// Apply per-type options. Casts are safe — guarded above.
+	if (OptionalBaseClass)
+	{
+		if (UBlackboardKeyType_Class* AsClassKT = Cast<UBlackboardKeyType_Class>(NewKT))
+		{
+			AsClassKT->BaseClass = OptionalBaseClass;
+		}
+		else if (UBlackboardKeyType_Object* AsObjectKT = Cast<UBlackboardKeyType_Object>(NewKT))
+		{
+			AsObjectKT->BaseClass = OptionalBaseClass;
+		}
+	}
+	if (OptionalEnumType)
+	{
+		UBlackboardKeyType_Enum* AsEnumKT = Cast<UBlackboardKeyType_Enum>(NewKT);
+		check(AsEnumKT);
+		AsEnumKT->EnumType = OptionalEnumType;
+	}
+
+	// Optional instance-synced flag (per-key bit on FBlackboardEntry, NOT on KeyType).
+	bool bInstanceSynced = false;
+	if (Request.Args.IsValid()) { Request.Args->TryGetBoolField(TEXT("instance_synced"), bInstanceSynced); }
+
+	FBlackboardEntry NewEntry;
+	NewEntry.EntryName      = KeyFName;
+	NewEntry.KeyType        = NewKT;
+	NewEntry.bInstanceSynced = bInstanceSynced ? 1 : 0;
+
+	BB->Modify();
+	const int32 NewIdx = BB->Keys.Add(NewEntry);
+	Scope.DirtyPackage(BB->GetPackage());
+
+	return FMCPJsonBuilder()
+		.Bool(TEXT("added"),     true)
+		.Str (TEXT("key_name"),  KeyName)
+		.Str (TEXT("key_type"),  KeyType)
+		.Int (TEXT("key_index"), NewIdx)
+		.Str (TEXT("bb_path"),   BB->GetPathName())
+		.BuildSuccess(Request);
+}
+
+// ─── ai.bb.remove_key (Wave P) ─────────────────────────────────────────────────────────────────
+//
+// Args:    { bb_path: string, key_name: string }
+// Result:  { removed, key_name, prior_key_type? }
+//
+// Removes a key by matching EntryName. Returns removed=false if the key wasn't present (caller can
+// treat as idempotent). Does NOT walk Parent keys — only this asset's own Keys[] list (engine
+// semantics: you can't "remove" an inherited parent key from a child).
+//
+// Errors:
+//   -32004 ObjectNotFound  bb_path not loadable
+//   -32027 PIEActive
+FMCPResponse Tool_RemoveKey(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_BBRemoveKey", "Remove Blackboard Key"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
+
+	FString BBPath, KeyName;
+	FMCPResponse Err;
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("bb_path"),  BBPath,  Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("key_name"), KeyName, Err)) { return Err; }
+
+	int32 LoadErr = 0;
+	FString LoadMsg;
+	UBlackboardData* BB = FMCPAssetLoader::Load<UBlackboardData>(BBPath, LoadErr, LoadMsg);
+	if (!BB) { return FMCPToolHelpers::MakeError(Request, LoadErr, LoadMsg); }
+
+	const FName KeyFName(*KeyName);
+	int32 FoundIdx = INDEX_NONE;
+	FString PriorTypeName;
+	for (int32 i = 0; i < BB->Keys.Num(); ++i)
+	{
+		if (BB->Keys[i].EntryName == KeyFName)
+		{
+			FoundIdx = i;
+			PriorTypeName = AIBB_KeyTypeToFriendlyName(BB->Keys[i].KeyType);
+			break;
+		}
+	}
+
+	if (FoundIdx == INDEX_NONE)
+	{
+		// Idempotent: report removed=false but DON'T raise — caller can call this in a cleanup loop
+		// without worrying about which keys exist.
+		return FMCPJsonBuilder()
+			.Bool(TEXT("removed"),  false)
+			.Str (TEXT("key_name"), KeyName)
+			.Str (TEXT("bb_path"),  BB->GetPathName())
+			.BuildSuccess(Request);
+	}
+
+	BB->Modify();
+	BB->Keys.RemoveAt(FoundIdx);
+	Scope.DirtyPackage(BB->GetPackage());
+
+	return FMCPJsonBuilder()
+		.Bool(TEXT("removed"),         true)
+		.Str (TEXT("key_name"),        KeyName)
+		.Str (TEXT("prior_key_type"),  PriorTypeName)
+		.Str (TEXT("bb_path"),         BB->GetPathName())
+		.BuildSuccess(Request);
+}
+
 // ─── Registration ─────────────────────────────────────────────────────────────────────────────
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)
 {
@@ -789,13 +1131,16 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 		OutRegisteredMethodNames.Add(MethodName);
 	};
 
-	RegisterTool(TEXT("ai.bb.list_keys"), &Tool_ListKeys, /*Lane A*/ false);
-	RegisterTool(TEXT("ai.bb.get_value"), &Tool_GetValue, /*Lane A*/ false);
-	RegisterTool(TEXT("ai.bb.set_value"), &Tool_SetValue, /*Lane A*/ false);
+	RegisterTool(TEXT("ai.bb.list_keys"),    &Tool_ListKeys,    /*Lane A*/ false);
+	RegisterTool(TEXT("ai.bb.get_value"),    &Tool_GetValue,    /*Lane A*/ false);
+	RegisterTool(TEXT("ai.bb.set_value"),    &Tool_SetValue,    /*Lane A*/ false);
+	RegisterTool(TEXT("ai.bb.create_asset"), &Tool_CreateAsset, /*Lane A*/ false);
+	RegisterTool(TEXT("ai.bb.add_key"),      &Tool_AddKey,      /*Lane A*/ false);
+	RegisterTool(TEXT("ai.bb.remove_key"),   &Tool_RemoveKey,   /*Lane A*/ false);
 
 	UE_LOG(LogMCP, Log,
-		TEXT("AIBlackboard surface registered: 3 ai.bb.* tools "
-			 "(list_keys + get_value + set_value), all Lane A"));
+		TEXT("AIBlackboard surface registered: 6 ai.bb.* tools "
+			 "(list_keys + get_value + set_value + create_asset + add_key + remove_key), all Lane A"));
 }
 
 } // namespace FAIBlackboardTools

@@ -79,8 +79,19 @@ namespace FAIEQSTools
 {
 	UNREALMCPBRIDGE_API void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames);
 
-	// --- Wave J Surface 4: AI / EQS tools --------------------------------------------------------
+	// --- Wave J Surface 4: AI / EQS tools (inspection + runtime) ---------------------------------
 	UNREALMCPBRIDGE_API FMCPResponse Tool_ListQueries(const FMCPRequest& Request);
 	UNREALMCPBRIDGE_API FMCPResponse Tool_GetQueryInfo(const FMCPRequest& Request);
 	UNREALMCPBRIDGE_API FMCPResponse Tool_RunQuery(const FMCPRequest& Request);
+
+	// --- Wave P: ai.eqs.* authoring --------------------------------------------------------------
+	// create_asset    NewObject<UEnvQuery> (empty Options[]); follow-up via add_generator / add_test.
+	// add_generator   NewObject<UEnvQueryOption> + NewObject<UEnvQueryGenerator> subobject, append to Options.
+	// add_test        NewObject<UEnvQueryTest> appended to Options[N].Tests. option_index from add_generator.
+	// Each tool runs Lane A, PIE-guarded via FMCPMutatorScope, applies optional properties via
+	// FMCPReflection::WritePropertyValue. NO new error codes — reuses -32004/-32011/-32020/-32023/
+	// -32026/-32027/-32603.
+	UNREALMCPBRIDGE_API FMCPResponse Tool_CreateAsset(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_AddGenerator(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_AddTest(const FMCPRequest& Request);
 }

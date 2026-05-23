@@ -5,11 +5,13 @@
 #include "FMCPDispatchQueue.h"
 #include "MCPAssetLoader.h"
 #include "MCPJsonBuilder.h"
+#include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
 #include "Utils/MCPAssetPathUtils.h"
 #include "Utils/MCPPageCursor.h"
+#include "Utils/MCPReflection.h"
 
 #include "AssetRegistry/ARFilter.h"
 #include "AssetRegistry/AssetData.h"
@@ -23,6 +25,11 @@
 #include "EnvironmentQuery/EnvQueryTypes.h"
 #include "GameFramework/Actor.h"
 #include "Engine/World.h"
+#include "Misc/PackageName.h"
+#include "Misc/Paths.h"
+#include "UObject/Class.h"
+#include "UObject/Package.h"
+#include "UObject/UnrealType.h"
 #include "UObject/UObjectGlobals.h"
 
 #include "Dom/JsonObject.h"
@@ -43,6 +50,93 @@ namespace
 	// kAIEQSErrorOperationFailed retired in Phase 4 — was -32015 (DOUBLE-MEANING bug with
 	// canonical kMCPErrorStaleCursor pagination semantics). Migrated to canonical
 	// kMCPErrorOperationFailed (-32058) per MCPTypes.h Phase 4 disambiguation.
+
+	// ─── Wave P authoring helpers ──────────────────────────────────────────────────────────────────
+
+	/**
+	 * Resolve a class path string to a UClass*, verifying it descends from BaseClass.
+	 * Tries the path verbatim first, then with a "_C" suffix (Blueprint generated class convention).
+	 * Returns nullptr + populates OutError on any failure mode.
+	 */
+	UClass* AIEQS_ResolveSubclassOf(const FString& ClassPath, UClass* BaseClass, FString& OutError)
+	{
+		if (ClassPath.IsEmpty())
+		{
+			OutError = TEXT("class path is empty");
+			return nullptr;
+		}
+		if (!ClassPath.StartsWith(TEXT("/")) || ClassPath.Contains(TEXT("\\")))
+		{
+			OutError = FString::Printf(
+				TEXT("class path '%s' must start with '/' and use forward slashes only"), *ClassPath);
+			return nullptr;
+		}
+
+		UClass* Resolved = LoadClass<UObject>(nullptr, *ClassPath);
+		if (!Resolved)
+		{
+			const FString WithC = ClassPath.EndsWith(TEXT("_C")) ? ClassPath : (ClassPath + TEXT("_C"));
+			Resolved = LoadClass<UObject>(nullptr, *WithC);
+		}
+		if (!Resolved)
+		{
+			OutError = FString::Printf(TEXT("could not LoadClass '%s' (also tried _C suffix)"), *ClassPath);
+			return nullptr;
+		}
+		if (Resolved->HasAnyClassFlags(CLASS_Abstract))
+		{
+			OutError = FString::Printf(TEXT("class '%s' is abstract — cannot instantiate"),
+				*Resolved->GetPathName());
+			return nullptr;
+		}
+		if (BaseClass && !Resolved->IsChildOf(BaseClass))
+		{
+			OutError = FString::Printf(
+				TEXT("class '%s' is not a subclass of '%s' (got family '%s')"),
+				*Resolved->GetPathName(), *BaseClass->GetPathName(),
+				Resolved->GetSuperClass() ? *Resolved->GetSuperClass()->GetPathName() : TEXT("?"));
+			return nullptr;
+		}
+		return Resolved;
+	}
+
+	/**
+	 * Apply a properties JSON dict to a target UObject via FMCPReflection::WritePropertyValue.
+	 * Top-level field name → property; value → FMCPReflection round-trip JSON shape.
+	 *
+	 * Populates OutApplied[] with successfully-written property names; OutSkipped[] with
+	 * descriptive skip messages (property not found / type mismatch / access denied).
+	 *
+	 * Does NOT wrap in FMCPWritePropertyScope per-property — caller owns the outer transaction
+	 * (FMCPMutatorScope holds it). PreEditChange/PostEditChangeProperty are skipped here because
+	 * the target is freshly-NewObject'd asset state, not an already-published asset — no editor
+	 * listeners are bound yet. The outer scope's MarkPackageDirty captures the change.
+	 */
+	void AIEQS_ApplyProperties(UObject* Target, const TSharedPtr<FJsonObject>& Props,
+		TArray<FString>& OutApplied, TArray<FString>& OutSkipped)
+	{
+		check(Target);
+		if (!Props.IsValid()) { return; }
+
+		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Props->Values)
+		{
+			const FString& PropName = Pair.Key;
+			FProperty* Prop = Target->GetClass()->FindPropertyByName(FName(*PropName));
+			if (!Prop)
+			{
+				OutSkipped.Add(FString::Printf(TEXT("%s: property not found on class '%s'"),
+					*PropName, *Target->GetClass()->GetName()));
+				continue;
+			}
+			FString WriteErr;
+			if (!FMCPReflection::WritePropertyValue(Target, Prop, Pair.Value, WriteErr))
+			{
+				OutSkipped.Add(FString::Printf(TEXT("%s: %s"), *PropName, *WriteErr));
+				continue;
+			}
+			OutApplied.Add(PropName);
+		}
+	}
 } // namespace
 
 namespace FAIEQSTools
@@ -432,6 +526,263 @@ FMCPResponse Tool_RunQuery(const FMCPRequest& Request)
 		.BuildSuccess(Request);
 }
 
+// --- ai.eqs.create_asset (Wave P) ------------------------------------------------------------
+//
+// Args:    { path: string }
+// Result:  { asset_path }
+//
+// Creates an empty UEnvQuery asset (Options[] empty) at the supplied path. Caller follows up with
+// ai.eqs.add_generator / ai.eqs.add_test to populate. Saves via cb.save / asset.save_loaded
+// (not auto-saved here).
+//
+// Errors:
+//   -32010 InvalidPath      malformed path
+//   -32014 PathInUse        path already exists
+//   -32027 PIEActive
+//   -32603 InternalError    CreatePackage / NewObject returned null
+FMCPResponse Tool_CreateAsset(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_EQSCreateAsset", "Create EQS Asset"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
+
+	FString DestPathRaw;
+	FMCPResponse Err;
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("path"), DestPathRaw, Err)) { return Err; }
+
+	const FString DestPathNorm = FMCPAssetPathUtils::Normalize(DestPathRaw);
+	if (DestPathNorm.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(DestPathNorm))
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
+			FString::Printf(TEXT("path '%s' malformed or unknown mount"), *DestPathRaw));
+	}
+
+	const FString PackagePath = FPaths::GetPath(DestPathNorm);
+	const FString AssetName   = FPaths::GetBaseFilename(DestPathNorm);
+
+	if (FPackageName::DoesPackageExist(DestPathNorm) ||
+		FindObject<UObject>(nullptr, *(DestPathNorm + TEXT(".") + AssetName)) != nullptr)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
+			FString::Printf(TEXT("path '%s' already exists"), *DestPathNorm));
+	}
+
+	UPackage* EQSPkg = CreatePackage(*DestPathNorm);
+	if (!EQSPkg)
+	{
+		return FMCPToolHelpers::MakeError(Request, kAIEQSErrorInternal,
+			FString::Printf(TEXT("CreatePackage returned null for '%s'"), *DestPathNorm));
+	}
+	EQSPkg->FullyLoad();
+
+	UEnvQuery* Query = NewObject<UEnvQuery>(
+		EQSPkg, *AssetName, RF_Public | RF_Standalone | RF_Transactional);
+	if (!Query)
+	{
+		return FMCPToolHelpers::MakeError(Request, kAIEQSErrorInternal,
+			FString::Printf(TEXT("NewObject<UEnvQuery> returned null for '%s'"), *DestPathNorm));
+	}
+
+	FAssetRegistryModule::AssetCreated(Query);
+	Scope.DirtyPackage(EQSPkg);
+
+	return FMCPJsonBuilder()
+		.Str(TEXT("asset_path"), Query->GetPathName())
+		.BuildSuccess(Request);
+}
+
+// --- ai.eqs.add_generator (Wave P) -----------------------------------------------------------
+//
+// Args:    { eqs_path: string, generator_class: string, properties?: {...} }
+// Result:  { added, option_index, generator_class, properties_applied, properties_skipped }
+//
+// Each generator lives inside a UEnvQueryOption (1:1) appended to UEnvQuery->Options. Tests are
+// then added separately via ai.eqs.add_test using the returned option_index.
+//
+// Pattern: NewObject<UEnvQueryOption>(EQS) → NewObject<UEnvQueryGenerator>(Option, ResolvedClass)
+//          → Option->Generator = Gen → ApplyProperties(Gen) → EQS->Options.Add(Option).
+//
+// Errors:
+//   -32004 ObjectNotFound  eqs_path not loadable
+//   -32011 WrongClass      generator_class is not a UEnvQueryGenerator subclass / abstract
+//   -32020 ClassNotFound   generator_class did not resolve
+//   -32023 InvalidClassPath  malformed class path
+//   -32027 PIEActive
+FMCPResponse Tool_AddGenerator(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_EQSAddGenerator", "Add EQS Generator"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
+
+	FString EQSPath, GeneratorClassPath;
+	FMCPResponse Err;
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("eqs_path"),        EQSPath,             Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("generator_class"), GeneratorClassPath,  Err)) { return Err; }
+
+	int32 LoadErr = 0;
+	FString LoadMsg;
+	UEnvQuery* Query = FMCPAssetLoader::Load<UEnvQuery>(EQSPath, LoadErr, LoadMsg);
+	if (!Query) { return FMCPToolHelpers::MakeError(Request, LoadErr, LoadMsg); }
+
+	FString ResolveErr;
+	UClass* GenClass = AIEQS_ResolveSubclassOf(GeneratorClassPath, UEnvQueryGenerator::StaticClass(), ResolveErr);
+	if (!GenClass)
+	{
+		// Distinguish family mismatch from "class not found" / "syntactically invalid". The string
+		// "is not a subclass" is a stable marker.
+		if (ResolveErr.Contains(TEXT("is not a subclass")))
+		{
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorWrongClass, ResolveErr);
+		}
+		if (ResolveErr.Contains(TEXT("must start with '/'")))
+		{
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidClassPath, ResolveErr);
+		}
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorClassNotFound, ResolveErr);
+	}
+
+	// Build option + generator. Option is owned by the EQS asset (parent ensures GC keeps it alive);
+	// generator is owned by the option (matches engine UEnvQuery serialization model — Options
+	// serialize Generator as a sub-object).
+	Query->Modify();
+
+	UEnvQueryOption* NewOpt = NewObject<UEnvQueryOption>(
+		Query, NAME_None, RF_Public | RF_Transactional);
+	check(NewOpt);
+	UEnvQueryGenerator* NewGen = NewObject<UEnvQueryGenerator>(
+		NewOpt, GenClass, NAME_None, RF_Public | RF_Transactional);
+	check(NewGen);
+	NewOpt->Generator = NewGen;
+
+	// Apply optional properties to the generator.
+	TArray<FString> PropsApplied, PropsSkipped;
+	const TSharedPtr<FJsonObject>* PropsObj = nullptr;
+	if (Request.Args.IsValid() && Request.Args->TryGetObjectField(TEXT("properties"), PropsObj)
+		&& PropsObj && (*PropsObj).IsValid())
+	{
+		AIEQS_ApplyProperties(NewGen, *PropsObj, PropsApplied, PropsSkipped);
+	}
+
+	const int32 OptionIdx = Query->GetOptionsMutable().Add(NewOpt);
+	Scope.DirtyPackage(Query->GetPackage());
+
+	FMCPJsonArrayBuilder AppliedArr;
+	for (const FString& S : PropsApplied) { AppliedArr.AddString(S); }
+	FMCPJsonArrayBuilder SkippedArr;
+	for (const FString& S : PropsSkipped) { SkippedArr.AddString(S); }
+
+	return FMCPJsonBuilder()
+		.Bool(TEXT("added"),               true)
+		.Int (TEXT("option_index"),        OptionIdx)
+		.Str (TEXT("generator_class"),     GenClass->GetPathName())
+		.Str (TEXT("eqs_path"),            Query->GetPathName())
+		.Arr (TEXT("properties_applied"),  AppliedArr.ToValueArray())
+		.Arr (TEXT("properties_skipped"),  SkippedArr.ToValueArray())
+		.BuildSuccess(Request);
+}
+
+// --- ai.eqs.add_test (Wave P) -----------------------------------------------------------------
+//
+// Args:    { eqs_path: string, option_index: int, test_class: string, properties?: {...} }
+// Result:  { added, test_index, test_class, properties_applied, properties_skipped }
+//
+// Appends a UEnvQueryTest to the specified option's Tests[]. Test ownership matches the engine
+// pattern: Option owns each Test sub-object.
+//
+// Errors:
+//   -32004 ObjectNotFound       eqs_path not loadable
+//   -32011 WrongClass           test_class is not a UEnvQueryTest subclass
+//   -32020 ClassNotFound        test_class did not resolve
+//   -32023 InvalidClassPath     malformed test_class path
+//   -32026 PropertyIndexOOB     option_index out of range
+//   -32027 PIEActive
+FMCPResponse Tool_AddTest(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_EQSAddTest", "Add EQS Test"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
+
+	FString EQSPath, TestClassPath;
+	int32 OptionIndex = 0;
+	FMCPResponse Err;
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("eqs_path"),     EQSPath,        Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireIntField   (Request, TEXT("option_index"), OptionIndex,    Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("test_class"),   TestClassPath,  Err)) { return Err; }
+
+	int32 LoadErr = 0;
+	FString LoadMsg;
+	UEnvQuery* Query = FMCPAssetLoader::Load<UEnvQuery>(EQSPath, LoadErr, LoadMsg);
+	if (!Query) { return FMCPToolHelpers::MakeError(Request, LoadErr, LoadMsg); }
+
+	const TArray<TObjectPtr<UEnvQueryOption>>& OptionsMut = Query->GetOptionsMutable();
+	if (OptionIndex < 0 || OptionIndex >= OptionsMut.Num())
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyIndexOOB,
+			FString::Printf(TEXT("option_index %d out of range [0, %d) for EQS '%s'"),
+				OptionIndex, OptionsMut.Num(), *Query->GetPathName()));
+	}
+	UEnvQueryOption* Option = OptionsMut[OptionIndex];
+	if (!Option)
+	{
+		// Null entry inside Options[] — corrupt asset; surface as InternalError so caller can
+		// distinguish from "no such index".
+		return FMCPToolHelpers::MakeError(Request, kAIEQSErrorInternal,
+			FString::Printf(TEXT("EQS '%s' has null entry at Options[%d] (corrupt asset?)"),
+				*Query->GetPathName(), OptionIndex));
+	}
+
+	FString ResolveErr;
+	UClass* TestClass = AIEQS_ResolveSubclassOf(TestClassPath, UEnvQueryTest::StaticClass(), ResolveErr);
+	if (!TestClass)
+	{
+		if (ResolveErr.Contains(TEXT("is not a subclass")))
+		{
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorWrongClass, ResolveErr);
+		}
+		if (ResolveErr.Contains(TEXT("must start with '/'")))
+		{
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidClassPath, ResolveErr);
+		}
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorClassNotFound, ResolveErr);
+	}
+
+	Query->Modify();
+	Option->Modify();
+
+	UEnvQueryTest* NewTest = NewObject<UEnvQueryTest>(
+		Option, TestClass, NAME_None, RF_Public | RF_Transactional);
+	check(NewTest);
+
+	TArray<FString> PropsApplied, PropsSkipped;
+	const TSharedPtr<FJsonObject>* PropsObj = nullptr;
+	if (Request.Args.IsValid() && Request.Args->TryGetObjectField(TEXT("properties"), PropsObj)
+		&& PropsObj && (*PropsObj).IsValid())
+	{
+		AIEQS_ApplyProperties(NewTest, *PropsObj, PropsApplied, PropsSkipped);
+	}
+
+	const int32 TestIdx = Option->Tests.Add(NewTest);
+	Scope.DirtyPackage(Query->GetPackage());
+
+	FMCPJsonArrayBuilder AppliedArr;
+	for (const FString& S : PropsApplied) { AppliedArr.AddString(S); }
+	FMCPJsonArrayBuilder SkippedArr;
+	for (const FString& S : PropsSkipped) { SkippedArr.AddString(S); }
+
+	return FMCPJsonBuilder()
+		.Bool(TEXT("added"),               true)
+		.Int (TEXT("test_index"),          TestIdx)
+		.Str (TEXT("test_class"),          TestClass->GetPathName())
+		.Int (TEXT("option_index"),        OptionIndex)
+		.Str (TEXT("eqs_path"),            Query->GetPathName())
+		.Arr (TEXT("properties_applied"),  AppliedArr.ToValueArray())
+		.Arr (TEXT("properties_skipped"),  SkippedArr.ToValueArray())
+		.BuildSuccess(Request);
+}
+
 // --- Registration ----------------------------------------------------------------------------
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)
 {
@@ -441,13 +792,16 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 		OutRegisteredMethodNames.Add(MethodName);
 	};
 
-	RegisterTool(TEXT("ai.eqs.list_queries"),   &Tool_ListQueries,  /*Lane A*/ false);
-	RegisterTool(TEXT("ai.eqs.get_query_info"), &Tool_GetQueryInfo, /*Lane A*/ false);
-	RegisterTool(TEXT("ai.eqs.run_query"),      &Tool_RunQuery,     /*Lane A*/ false);
+	RegisterTool(TEXT("ai.eqs.list_queries"),   &Tool_ListQueries,   /*Lane A*/ false);
+	RegisterTool(TEXT("ai.eqs.get_query_info"), &Tool_GetQueryInfo,  /*Lane A*/ false);
+	RegisterTool(TEXT("ai.eqs.run_query"),      &Tool_RunQuery,      /*Lane A*/ false);
+	RegisterTool(TEXT("ai.eqs.create_asset"),   &Tool_CreateAsset,   /*Lane A*/ false);
+	RegisterTool(TEXT("ai.eqs.add_generator"),  &Tool_AddGenerator,  /*Lane A*/ false);
+	RegisterTool(TEXT("ai.eqs.add_test"),       &Tool_AddTest,       /*Lane A*/ false);
 
 	UE_LOG(LogMCP, Log,
-		TEXT("AIEQS surface registered: 3 ai.eqs.* tools "
-			 "(list_queries + get_query_info + run_query), all Lane A"));
+		TEXT("AIEQS surface registered: 6 ai.eqs.* tools "
+			 "(list_queries + get_query_info + run_query + create_asset + add_generator + add_test), all Lane A"));
 }
 
 } // namespace FAIEQSTools
