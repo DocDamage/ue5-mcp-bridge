@@ -21,6 +21,7 @@
 #include "AssetToolsModule.h"
 #include "Editor.h"
 #include "Engine/DataAsset.h"
+#include "HAL/CriticalSection.h"
 #include "Factories/DataAssetFactory.h"
 #include "Factories/Factory.h"
 #include "IAssetTools.h"
@@ -47,6 +48,12 @@
 
 namespace
 {
+	// Wave Q4 (2026-05-24) — defense-in-depth lock for Lane B-promoted asset.dependency_graph.
+	// IAssetRegistry::GetDependencies / GetReferencers are documented thread-safe but we keep a
+	// module-scoped lock to serialise concurrent calls — protects against registry-internal hash
+	// rebuilds that may briefly invalidate iterator state during heavy asset operations.
+	static FCriticalSection gAssetRegistryQueryLock;
+
 	// AR_ prefix per the unity-build symbol-collision pattern. XX_StampIds / XX_MakeError /
 	// XX_MakeSuccessObj removed in Phase 3 — use FMCPToolHelpers::Xxx from MCPToolHelpers.h.
 	// kMCPErrorInvalidParams replaced by canonical kMCPErrorInvalidParams.
@@ -741,10 +748,13 @@ FMCPResponse Tool_AssetFindDependents(const FMCPRequest& Request)
 // Per critique Q3 decision, edges carry an explicit ``direction`` field. ``package_size_bytes`` is
 // best-effort on-disk size (-1 / null when package is in-memory-only, per critique N2).
 //
-// Lane A initially (per critique Q4); reviewer audits Lane B promotion in followup. Auto-register
-// already covers this surface — no change to MCP_REGISTER_SURFACE line needed.
+// Lane B (Wave Q4 promotion) — IAssetRegistry::GetDependencies / GetReferencers + FAssetData
+// reads only; no UObject mutation, no GEditor touches. gAssetRegistryQueryLock serialises
+// concurrent calls for defense against registry-internal hash rebuilds.
 FMCPResponse Tool_AssetDependencyGraph(const FMCPRequest& Request)
 {
+	FScopeLock Lock(&gAssetRegistryQueryLock);
+
 	FString NormalizedPath;
 	FMCPResponse Err;
 	if (!AR_RequirePath(Request, NormalizedPath, Err)) { return Err; }
@@ -2179,7 +2189,7 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 
 	// Wave M (M2) — recursive dep/referencer graph (BFS). All Lane A per critique Q4 ("ship working
 	// tools first, optimise threading separately"); reviewer audits Lane B promotion in followup.
-	RegisterTool(TEXT("asset.dependency_graph"),        &Tool_AssetDependencyGraph,       /*Lane A*/          false);
+	RegisterTool(TEXT("asset.dependency_graph"),        &Tool_AssetDependencyGraph,       /*Lane B (Wave Q4)*/ true);
 
 	UE_LOG(LogMCP, Log, TEXT("Phase 2 hotfix: registered 14 asset.* handlers (all Lane A — UE 5.7 AR not thread-safe; Wave M added dependency_graph)"));
 }

@@ -17,6 +17,7 @@
 #include "Engine/Engine.h"
 #include "Engine/Selection.h"
 #include "GameFramework/Actor.h"
+#include "HAL/CriticalSection.h"
 #include "HAL/FileManager.h"
 #include "IImageWrapper.h"
 #include "IImageWrapperModule.h"
@@ -42,6 +43,13 @@ namespace
 	// Phase 1 helper extraction (commit b2fd19d).
 	constexpr int32 kSHOTErrorInvalidParams = -32602;
 	constexpr int32 kSHOTErrorInternal      = -32603;
+
+	// Wave Q4 (2026-05-24) — defense-in-depth lock shared by Lane B pure-compute tools
+	// (screenshot.diff + screenshot.annotate). FImageUtils + FFileHelper are documented
+	// thread-safe internally, but defense-in-depth: serialise concurrent calls so a future
+	// regression in FImage's TLS / static caches won't crash worker threads. Hold cost is
+	// the per-call image load + pixel loop; both are bounded (4K cap from MaxPixelCount).
+	static FCriticalSection gScreenshotComputeLock;
 
 	// high_resolution caps. Multiplier ≥ 1.0 (anything below is a downscale — not a "hi-res"
 	// operation; if the caller wants downscale they should use editor.viewport_screenshot_to_disk
@@ -1154,7 +1162,10 @@ FMCPResponse Tool_CaptureSelection(const FMCPRequest& Request)
 // an error.
 FMCPResponse Tool_Diff(const FMCPRequest& Request)
 {
-	// NO check(IsInGameThread()) — this runs on a worker thread.
+	// Lane B — runs on a worker thread (no check(IsInGameThread)). Wave Q4 added the
+	// defense-in-depth lock so two concurrent screenshot.diff calls serialise (FImageUtils
+	// uses TLS allocators internally; serialising guards against any future regression).
+	FScopeLock Lock(&gScreenshotComputeLock);
 
 	if (!Request.Args.IsValid())
 	{
@@ -1489,7 +1500,10 @@ FMCPResponse Tool_Diff(const FMCPRequest& Request)
 // Lane A initially (file IO); reviewer audits Lane B promotion in followup. Pure-compute eligible.
 FMCPResponse Tool_Annotate(const FMCPRequest& Request)
 {
-	// NO check(IsInGameThread()) — pure file IO + compute.
+	// Lane B — pure file IO + compute, no UObject / GEditor touches. Wave Q4 promoted from
+	// Lane A and added the shared gScreenshotComputeLock for defense-in-depth alongside
+	// screenshot.diff (both consume FImageUtils + FFileHelper).
+	FScopeLock Lock(&gScreenshotComputeLock);
 
 	if (!Request.Args.IsValid())
 	{
@@ -1900,7 +1914,7 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	RegisterTool(TEXT("screenshot.diff"),            &Tool_Diff,           /*Lane B*/ true);
 	// Wave M (M5) annotate — Lane A initially (file IO); reviewer audits Lane B promotion. Pure
 	// compute eligible (BlendPixel + DrawBox/DrawLine/DrawCircle are no-UObject).
-	RegisterTool(TEXT("screenshot.annotate"),        &Tool_Annotate,       /*Lane A*/ false);
+	RegisterTool(TEXT("screenshot.annotate"),        &Tool_Annotate,       /*Lane B (Wave Q4)*/ true);
 
 	UE_LOG(LogMCP, Log,
 		TEXT("Screenshot extended surface registered: 6 screenshot.* tools "
