@@ -88,6 +88,30 @@ FString Normalize(const FString& InPath)
 		return {};
 	}
 
+	// Wave R+1 hardening (2026-05-24): reject control characters and path length overflow.
+	// Discovered via stress test T5: paths with embedded NUL bytes (\x00) and 200+ char paths
+	// were being accepted by create_blueprint, then passing through to engine asset creation
+	// where they'd silently truncate / corrupt asset registry state. Reject EARLY at the
+	// validation layer so every surface inherits the defence (~65 surfaces protected by 1 fix).
+	for (TCHAR Ch : Path)
+	{
+		// Block control codes (NUL through US, DEL) — none belong in a UE asset path. The
+		// inclusive upper bound 0x1F catches null + bell + escape + every C0 control. 0x7F is
+		// DEL. Tab/newline/CR fall in this range too — also illegal in asset paths.
+		if (Ch < 0x20 || Ch == 0x7F)
+		{
+			return {};
+		}
+	}
+
+	// Windows MAX_PATH = 260. Asset paths get suffixed with ``.uasset`` (8 chars), and may be
+	// further extended by tool wrappers (e.g. ``/Saved/...thumbnail.png`` paths). Cap at 240 to
+	// leave headroom; UE asset names rarely exceed 64 chars in practice, so 240 is generous.
+	if (Path.Len() > 240)
+	{
+		return {};
+	}
+
 	// Backslash rejected. Windows-style paths must not reach the asset-registry — they confuse
 	// FPackageName's split logic which assumes UE's forward-slash convention.
 	if (Path.Contains(TEXT("\\"), ESearchCase::CaseSensitive))
