@@ -666,6 +666,70 @@ class TestLogger:
         return summary_obj
 
 # ============================================================================
+# Field-aware dummy values (used by Phase A2 chain walker)
+# ============================================================================
+#
+# UE has a number of internal "smart" constructors (FTopLevelAssetPath,
+# FName::Init, FSoftObjectPath) that ensure() against malformed input. A
+# plain "x" string passed as `class_path` is enough to trip
+# FTopLevelAssetPath::TrySetPath → ensureMsgf → 2s stack walk per call →
+# repeated calls eventually destabilise the editor.
+#
+# These dummies provide safe placeholder values that *parse* as
+# well-formed paths/identifiers but typically resolve to "not found"
+# (-32004) downstream — proving arg validation passed without crashing
+# the editor.
+
+_SAFE_CLASS_PATH = "/Script/Engine.Actor"
+_SAFE_GAME_PATH = "/Game/_phantom_ultimate_path/X"
+_SAFE_ASSET_REF = "/Script/Engine.Default__Actor"
+_SAFE_FOLDER = "/Game/_phantom_ultimate_folder"
+
+# Field-name heuristics. Returns dummy string for the given typ/field combo.
+def _dummy_string_for_field(field: str) -> str:
+    f = field.lower()
+    # 1. Class path fields — must be /Script/Module.ClassName format
+    if "class_path" in f or f == "class" or f == "parent_class" or f == "blueprint_parent_class":
+        return _SAFE_CLASS_PATH
+    # 2. Object/soft-object refs
+    if f == "object_path" or f == "soft_object" or "_object_path" in f:
+        return _SAFE_ASSET_REF
+    # 3. Folder paths — content browser semantics
+    if "folder" in f and "path" in f:
+        return _SAFE_FOLDER
+    # 4. Generic asset/package/source/dest path-like fields
+    if (
+        f.endswith("_path") or f == "path" or "package" in f
+        or f.endswith("_dir") or f == "dir"
+    ):
+        return _SAFE_GAME_PATH
+    # 5. INI / log / cvar names — non-asset string IDs
+    if f in {"name", "cvar", "ini_file", "section", "key", "category", "tag"}:
+        return "x"
+    # 6. Default — short generic string (most code accepts this)
+    return "x"
+
+
+def dummy_value(typ: str, field: str = "") -> Any:
+    """Returns a safe dummy value for a (type, field-name) pair.
+
+    Designed so that any required-arg probe satisfies the validator without
+    triggering UE-internal ensure() handlers (e.g. FTopLevelAssetPath).
+    """
+    t = typ.lower()
+    if t in ("string",):
+        return _dummy_string_for_field(field)
+    if t in ("number", "int", "uint", "float", "double"):
+        return 0
+    if t in ("bool",):
+        return False
+    if t in ("array",):
+        return ["x"]
+    if t in ("object",):
+        return {"k": "v"}
+    return "x"
+
+# ============================================================================
 # Misc utilities
 # ============================================================================
 
