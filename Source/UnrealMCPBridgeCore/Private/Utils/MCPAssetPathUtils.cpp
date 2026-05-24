@@ -169,6 +169,60 @@ bool IsValidGameOrPlugin(const FString& NormalizedPath)
 	return IsKnownMountPoint(NormalizedPath);
 }
 
+bool IsWriteableMountPoint(const FString& NormalizedPath)
+{
+	if (NormalizedPath.IsEmpty())
+	{
+		return false;
+	}
+
+	// Hard-deny engine-owned namespaces. These are never user-writeable regardless of mount
+	// registration state. Paths matching exactly the mount name (e.g. "/Engine") or having
+	// the mount-name prefix (e.g. "/Engine/Foo") are both blocked.
+	const TCHAR* const ReadOnlyPrefixes[] = {
+		TEXT("/Engine/"),
+		TEXT("/Script/"),
+		TEXT("/Memory/"),
+	};
+	for (const TCHAR* Prefix : ReadOnlyPrefixes)
+	{
+		if (NormalizedPath.StartsWith(Prefix, ESearchCase::CaseSensitive))
+		{
+			return false;
+		}
+		// Bare mount-name match (no trailing component)
+		FString Bare(Prefix);
+		Bare.LeftChopInline(1, EAllowShrinking::No);  // drop trailing '/'
+		if (NormalizedPath.Equals(Bare, ESearchCase::CaseSensitive))
+		{
+			return false;
+		}
+	}
+
+	// Pull writable-only content paths from UE. bIncludeReadOnlyRoots=false excludes
+	// /Engine + any plugin marked read-only. /Game is always writable in editor.
+	TArray<FString> Mounts;
+	FPackageName::QueryRootContentPaths(Mounts, /*bIncludeReadOnlyRoots*/ false,
+		/*bWithoutLeadingSlashes*/ false, /*bWithoutTrailingSlashes*/ false);
+	for (const FString& Mount : Mounts)
+	{
+		FString MountTrimmed = Mount;
+		while (MountTrimmed.EndsWith(TEXT("/"), ESearchCase::CaseSensitive))
+		{
+			MountTrimmed.LeftChopInline(1, EAllowShrinking::No);
+		}
+		if (NormalizedPath.Equals(MountTrimmed, ESearchCase::CaseSensitive))
+		{
+			return true;
+		}
+		if (NormalizedPath.StartsWith(MountTrimmed + TEXT("/"), ESearchCase::CaseSensitive))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
 FString ToPackageName(const FString& NormalizedPath)
 {
 	// Normalize already strips the leaf suffix — this is the canonical package-name form.

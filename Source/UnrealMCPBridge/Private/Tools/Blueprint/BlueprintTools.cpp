@@ -2259,6 +2259,17 @@ FMCPResponse Tool_CreateBlueprint(const FMCPRequest& Request)
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 			FString::Printf(TEXT("dest_path '%s' is not a valid mount-prefixed path"), *DestPathRaw));
 	}
+	// Wave S+7 (2026-05-24): writeable-mount guard. bp.create_blueprint bypasses
+	// FMCPAssetFactory::Create (uses IAssetTools::CreateAsset directly), so the check must
+	// be applied explicitly here. Without it, user could create BPs into /Engine/ namespace.
+	if (!FMCPAssetPathUtils::IsWriteableMountPoint(DestPathNorm))
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
+			FString::Printf(
+				TEXT("dest_path '%s' is not a writeable content mount (must be /Game/... or "
+					 "writable plugin content — /Engine, /Script, /Memory rejected)"),
+				*DestPathNorm));
+	}
 	const FString PackagePath = FPaths::GetPath(DestPathNorm);
 	const FString AssetName = FPaths::GetBaseFilename(DestPathNorm);
 

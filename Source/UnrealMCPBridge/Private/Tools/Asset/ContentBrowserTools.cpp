@@ -151,6 +151,16 @@ FMCPResponse Tool_CreateFolder(const FMCPRequest& Request)
 	FMCPResponse Err;
 	if (!CB_RequirePath(Request, TEXT("path"), NormalizedPath, Err)) { return Err; }
 
+	// Wave S+7 guard: reject writes into read-only mounts (/Engine/, /Script/, /Memory/, etc.)
+	if (!FMCPAssetPathUtils::IsWriteableMountPoint(NormalizedPath))
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
+			FString::Printf(
+				TEXT("path '%s' is not a writeable content mount (must be /Game/... or "
+					 "writable plugin content)"),
+				*NormalizedPath));
+	}
+
 	UEditorAssetSubsystem* Subsys = CB_GetSubsystem();
 	if (Subsys == nullptr)
 	{
@@ -190,6 +200,17 @@ FMCPResponse Tool_Rename(const FMCPRequest& Request)
 	FMCPResponse Err;
 	if (!CB_RequirePath(Request, TEXT("old_path"), OldNormalized, Err)) { return Err; }
 	if (!CB_RequirePath(Request, TEXT("new_path"), NewNormalized, Err)) { return Err; }
+
+	// Wave S+7 guard: writes target must be in a writeable mount. Old path can be wherever
+	// (delete-from-engine is also blocked at engine level; we just gate the destination).
+	if (!FMCPAssetPathUtils::IsWriteableMountPoint(NewNormalized))
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
+			FString::Printf(
+				TEXT("new_path '%s' is not a writeable content mount (must be /Game/... or "
+					 "writable plugin content — /Engine, /Script, /Memory rejected)"),
+				*NewNormalized));
+	}
 
 	UEditorAssetSubsystem* Subsys = CB_GetSubsystem();
 	if (Subsys == nullptr)
@@ -388,6 +409,16 @@ FMCPResponse Tool_Duplicate(const FMCPRequest& Request)
 	FMCPResponse Err;
 	if (!CB_RequirePath(Request, TEXT("source_path"), Src,  Err)) { return Err; }
 	if (!CB_RequirePath(Request, TEXT("dest_path"),   Dest, Err)) { return Err; }
+
+	// Wave S+7 guard: destination must be in a writeable content mount.
+	if (!FMCPAssetPathUtils::IsWriteableMountPoint(Dest))
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
+			FString::Printf(
+				TEXT("dest_path '%s' is not a writeable content mount (must be /Game/... or "
+					 "writable plugin content)"),
+				*Dest));
+	}
 
 	UEditorAssetSubsystem* Subsys = CB_GetSubsystem();
 	if (Subsys == nullptr)

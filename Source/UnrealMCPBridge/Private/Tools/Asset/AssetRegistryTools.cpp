@@ -1768,6 +1768,16 @@ FMCPResponse Tool_AssetCreateDataAsset(const FMCPRequest& Request)
 			FString::Printf(TEXT("dest_path '%s' is not a valid mount-prefixed asset path "
 				"(expected /Game/... or /<Plugin>/...)"), *DestPathRaw));
 	}
+	// Wave S+7 (2026-05-24): writeable-mount guard. asset.create_data_asset bypasses
+	// FMCPAssetFactory::Create, so check explicitly. Without this, DA can pollute /Engine etc.
+	if (!FMCPAssetPathUtils::IsWriteableMountPoint(DestPathNorm))
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
+			FString::Printf(
+				TEXT("dest_path '%s' is not a writeable content mount (must be /Game/... or "
+					 "writable plugin content — /Engine, /Script, /Memory rejected)"),
+				*DestPathNorm));
+	}
 	// ─── Create via UDataAssetFactory + IAssetTools::CreateAsset ───────────────────────────────
 	const FString PackagePath = FPaths::GetPath(DestPathNorm);
 	const FString AssetName   = FPaths::GetBaseFilename(DestPathNorm);
@@ -1900,6 +1910,18 @@ FMCPResponse Tool_AssetCreate(const FMCPRequest& Request)
 	{
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 			FString::Printf(TEXT("dest_path '%s' is not a valid mount-prefixed asset path"), *DestPathRaw));
+	}
+	// Wave S+7 (2026-05-24): block writes into engine-owned namespaces. asset.create has its
+	// own flow that bypasses FMCPAssetFactory::Create, so the guard must be applied here too.
+	// Without this, user assets can pollute /Engine/, /Script/, /Memory/ — verified bug via
+	// WS3 stress test (BUG H+1 in the writeable-mount audit).
+	if (!FMCPAssetPathUtils::IsWriteableMountPoint(DestPathNorm))
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
+			FString::Printf(
+				TEXT("dest_path '%s' is not a writeable content mount (must be /Game/... or "
+					 "writable plugin content — /Engine, /Script, /Memory rejected)"),
+				*DestPathNorm));
 	}
 	const FString PackagePath = FPaths::GetPath(DestPathNorm);
 	const FString AssetName   = FPaths::GetBaseFilename(DestPathNorm);

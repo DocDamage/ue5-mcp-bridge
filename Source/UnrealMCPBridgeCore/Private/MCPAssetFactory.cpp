@@ -29,13 +29,18 @@ namespace FMCPAssetFactory
 			return R;
 		}
 
-		// 1. Path normalize + mount validation. Matches the prior per-surface pattern:
-		//    FMCPAssetPathUtils::Normalize → IsValidGameOrPlugin guard.
+		// 1. Path normalize + mount validation. Wave S+7 (2026-05-24): switched IsValidGameOrPlugin
+		//    → IsWriteableMountPoint. The looser check let asset creation tools write into /Engine,
+		//    /Script, /Memory mounts (verified via WS3 stress test). Tighter guard rejects those
+		//    namespaces upfront, keeping every create call to /Game or writable plugin content.
 		const FString DestPathNorm = FMCPAssetPathUtils::Normalize(InAssetPath);
-		if (DestPathNorm.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(DestPathNorm))
+		if (DestPathNorm.IsEmpty() || !FMCPAssetPathUtils::IsWriteableMountPoint(DestPathNorm))
 		{
 			R.ErrorCode    = kMCPErrorInvalidPath;
-			R.ErrorMessage = FString::Printf(TEXT("path '%s' malformed or unknown mount"), *InAssetPath);
+			R.ErrorMessage = FString::Printf(
+				TEXT("path '%s' malformed or not a writeable content mount (must be /Game/... "
+					 "or a writable plugin content directory — /Engine, /Script, /Memory rejected)"),
+				*InAssetPath);
 			return R;
 		}
 

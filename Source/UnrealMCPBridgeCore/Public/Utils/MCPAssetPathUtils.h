@@ -54,6 +54,21 @@ namespace FMCPAssetPathUtils
 	UNREALMCPBRIDGECORE_API bool IsValidGameOrPlugin(const FString& NormalizedPath);
 
 	/**
+	 * Wave S+7 (2026-05-24): Validate that ``InPath`` is in a WRITEABLE content mount —
+	 * i.e. ``/Game/`` or a writable plugin content directory. Excludes engine-owned mounts
+	 * (``/Engine/``, ``/Script/``, ``/Memory/``) and any read-only plugin content paths.
+	 *
+	 * Use this in create/rename/duplicate flows to prevent user assets polluting engine
+	 * namespaces. The looser ``IsValidGameOrPlugin`` is still appropriate for READ-side
+	 * operations (asset.exists, asset.get_property, asset.list, etc.) where reading from
+	 * /Engine is legitimate.
+	 *
+	 * Returns false for: empty input, paths starting with /Engine/, /Script/, /Memory/,
+	 * or any mount NOT reported by ``QueryRootContentPaths(bIncludeReadOnlyRoots=false)``.
+	 */
+	UNREALMCPBRIDGECORE_API bool IsWriteableMountPoint(const FString& NormalizedPath);
+
+	/**
 	 * Package-name form: ``/Game/Foo/Bar`` (no class suffix, no leading whitespace). Equivalent to
 	 * ``Normalize`` today — the function is named explicitly so handler code reads as
 	 * intent-revealing.

@@ -755,11 +755,14 @@ FMCPResponse Tool_CreateEmitter(const FMCPRequest& Request)
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("dest_path"), DestPathRaw, Err)) { return Err; }
 
 	const FString DestPathNorm = FMCPAssetPathUtils::Normalize(DestPathRaw);
-	if (DestPathNorm.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(DestPathNorm))
+	// Wave S+7 (2026-05-24): tightened from IsValidGameOrPlugin (which allowed /Engine etc.)
+	// to IsWriteableMountPoint. Writes into engine-owned namespaces would pollute the registry.
+	if (DestPathNorm.IsEmpty() || !FMCPAssetPathUtils::IsWriteableMountPoint(DestPathNorm))
 	{
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 			FString::Printf(
-				TEXT("dest_path '%s' is malformed or references an unknown mount (need /Game/... or /Plugin/...)"),
+				TEXT("dest_path '%s' is malformed or not a writeable content mount (must be "
+					 "/Game/... or writable plugin content — /Engine, /Script, /Memory rejected)"),
 				*DestPathRaw));
 	}
 	const FString PackagePath = FPaths::GetPath(DestPathNorm);
