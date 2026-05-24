@@ -339,6 +339,25 @@ bool FromJson(
 		OutPinType.PinSubCategory = FName(*SubCat);
 	}
 
+	// Wave S+5 fix (2026-05-24): PC_Real REQUIRES subcategory "float" or "double" — otherwise
+	// UE's KismetCompilerMisc.cpp:1453 asserts `Erroneous pin subcategory for PC_Real: None`
+	// during bp.compile and CRASHES the editor. Validate upfront so we surface a clean
+	// -32032 error instead of letting the engine assert. (Reproduced in WS3 stress test Phase H.)
+	if (Category == UEdGraphSchema_K2::PC_Real)
+	{
+		const FString Sub = OutPinType.PinSubCategory.ToString();
+		if (!Sub.Equals(TEXT("float"), ESearchCase::CaseSensitive)
+			&& !Sub.Equals(TEXT("double"), ESearchCase::CaseSensitive))
+		{
+			OutErrorCode = kMCPErrorPinTypeUnsupported;
+			OutError = FString::Printf(
+				TEXT("pin_type category 'Real' requires subcategory 'float' or 'double' (got '%s'); "
+					 "UE's BP compiler asserts on missing subcategory for PC_Real and crashes the editor"),
+				Sub.IsEmpty() ? TEXT("(empty)") : *Sub);
+			return false;
+		}
+	}
+
 	FString SubObjPath;
 	if (Obj->TryGetStringField(TEXT("subcategory_object_path"), SubObjPath) && !SubObjPath.IsEmpty())
 	{
