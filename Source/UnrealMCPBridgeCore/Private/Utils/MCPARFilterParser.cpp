@@ -117,6 +117,14 @@ bool Parse(const TSharedPtr<FJsonObject>& InJson, FARFilter& OutFilter, FString&
 				Normalised[LastSlash] = TEXT('.');
 			}
 		}
+		// S+16: pre-validate before TrySetPath — UE 5.7 fires ensureMsgf on any
+		// input lacking a '.', which is a ~2s stack walk per call. Hostile fuzz
+		// of cb.list / asset.list with class_paths=["x"] destabilises the editor.
+		if (!Normalised.Contains(TEXT("."), ESearchCase::CaseSensitive))
+		{
+			OutError = FString::Printf(TEXT("filter.class_paths: '%s' must contain a '.' (e.g. '/Script/Engine.StaticMesh')"), *S);
+			return false;
+		}
 		FTopLevelAssetPath Top;
 		if (!Top.TrySetPath(Normalised))
 		{

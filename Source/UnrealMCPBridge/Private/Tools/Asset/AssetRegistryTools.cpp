@@ -1076,6 +1076,17 @@ FMCPResponse Tool_AssetSearchByClass(const FMCPRequest& Request)
 			ClassPathNormalized[LastSlash] = TEXT('.');
 		}
 	}
+	// S+16: pre-validate that we have a path with a '.' separator BEFORE
+	// calling FTopLevelAssetPath::TrySetPath. In UE 5.7 TrySetPath fires
+	// ensureMsgf("Short asset name used to create FTopLevelAssetPath") on any
+	// input lacking a '.', which is a ~2s stack walk per call. Hostile fuzz
+	// (many short strings in succession) destabilises the editor — see
+	// crash dump UECC-Windows-9865DCF34F4B3E4BDB4959ADFAECD6E7_0001.
+	if (!ClassPathNormalized.Contains(TEXT(".")))
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorWrongClass,
+			FString::Printf(TEXT("class_path '%s' must be a full path like '/Script/Engine.StaticMeshActor' (got no '.' separator)"), *ClassPath));
+	}
 	FTopLevelAssetPath Top;
 	if (!Top.TrySetPath(ClassPathNormalized))
 	{
