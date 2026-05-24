@@ -543,6 +543,12 @@ FMCPResponse Tool_GetData(const FMCPRequest& Request)
 
 	FString RowName;
 	if (Request.Args.IsValid()) { Request.Args->TryGetStringField(TEXT("key"), RowName); }
+	// Wave S+10: FName length guard on the row name (used to build FName(*RowName) inside).
+	if (!RowName.IsEmpty())
+	{
+		FMCPResponse KeyLenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("key"), RowName, KeyLenErr)) { return KeyLenErr; }
+	}
 
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
@@ -649,6 +655,12 @@ FMCPResponse Tool_SetData(const FMCPRequest& Request)
 
 	FString RowName;
 	if (Request.Args.IsValid()) { Request.Args->TryGetStringField(TEXT("key"), RowName); }
+	// Wave S+10: FName length guard on the row name (used to build FName(*RowName) inside).
+	if (!RowName.IsEmpty())
+	{
+		FMCPResponse KeyLenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("key"), RowName, KeyLenErr)) { return KeyLenErr; }
+	}
 
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
@@ -795,6 +807,12 @@ FMCPResponse Tool_AddKey(const FMCPRequest& Request)
 
 	FString RowName;
 	Request.Args->TryGetStringField(TEXT("key"), RowName);
+	// Wave S+10: FName length guard.
+	if (!RowName.IsEmpty())
+	{
+		FMCPResponse KeyLenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("key"), RowName, KeyLenErr)) { return KeyLenErr; }
+	}
 
 	FString ChannelName;
 	Request.Args->TryGetStringField(TEXT("channel"), ChannelName);

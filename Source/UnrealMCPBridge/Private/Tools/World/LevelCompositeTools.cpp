@@ -408,7 +408,12 @@ FMCPResponse Tool_FindActorsWithClassInternal(const FMCPRequest& Request)
 			FString S;
 			if (V.IsValid() && V->TryGetString(S) && !S.IsEmpty())
 			{
-				LevelPaths.Add(FMCPWorldContext::NormaliseMapPath(S));
+				const FString Normalized = FMCPWorldContext::NormaliseMapPath(S);
+				// Wave S+10: FName length guard on captured path strings — listener thread will
+				// build FName(*Path) inside the job body, must not exceed UE's 1023-char limit.
+				FMCPResponse PathLenErr;
+				if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("level_paths[]"), Normalized, PathLenErr)) { return PathLenErr; }
+				LevelPaths.Add(Normalized);
 			}
 		}
 	}
@@ -700,6 +705,17 @@ FMCPResponse Tool_BatchSpawnInternal(const FMCPRequest& Request)
 				FString DesiredName;
 				if (Item->TryGetStringField(TEXT("name"), DesiredName) && !DesiredName.IsEmpty())
 				{
+					// Wave S+10: FName length guard — per-row failure (push to Failed array, continue batch).
+					if (DesiredName.Len() > 256)
+					{
+						Failed.Add(MakeShared<FJsonValueObject>(LCO_MakeFailureEntry(
+							i, kLCOErrorInvalidParams,
+							FString::Printf(
+								TEXT("name length %d exceeds 256-char cap; UE FName limit (NAME_SIZE-1=1023) "
+									 "would be exceeded after path-prefix qualification"),
+								DesiredName.Len()))));
+						continue;
+					}
 					Params.Name = FName(*DesiredName);
 					Params.NameMode = FActorSpawnParameters::ESpawnActorNameMode::Requested;
 				}

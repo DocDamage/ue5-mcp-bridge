@@ -221,12 +221,23 @@ FMCPResponse Tool_AddComponent(const FMCPRequest& Request)
 		return FMCPToolHelpers::MakeError(Request, kBPSCSErrorInvalidParams,
 			TEXT("missing required string field 'variable_name'"));
 	}
+	// Wave S+10: FName length guard.
+	{
+		FMCPResponse LenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("variable_name"), VariableNameStr, LenErr)) { return LenErr; }
+	}
 
 	// Optional parent component selector. When omitted/empty we fall back to DefaultSceneRoot (or
 	// the first root node if DefaultSceneRoot is null after asset edits).
 	FString ParentVarStr;
 	const bool bParentProvided =
 		Request.Args->TryGetStringField(TEXT("parent_component"), ParentVarStr) && !ParentVarStr.IsEmpty();
+	if (bParentProvided)
+	{
+		// Wave S+10: FName length guard.
+		FMCPResponse LenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("parent_component"), ParentVarStr, LenErr)) { return LenErr; }
+	}
 
 	FMCPResponse ResolveErr;
 	UBlueprint* Blueprint = BPSCS_ResolveBlueprintOrError(Request, Path, ResolveErr);
@@ -377,6 +388,11 @@ FMCPResponse Tool_RemoveComponent(const FMCPRequest& Request)
 	{
 		return FMCPToolHelpers::MakeError(Request, kBPSCSErrorInvalidParams,
 			TEXT("missing required string field 'variable_name'"));
+	}
+	// Wave S+10: FName length guard.
+	{
+		FMCPResponse LenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("variable_name"), VariableNameStr, LenErr)) { return LenErr; }
 	}
 
 	FMCPResponse ResolveErr;
@@ -572,6 +588,11 @@ FMCPResponse Tool_SetComponentDefault(const FMCPRequest& Request)
 	{
 		return FMCPToolHelpers::MakeError(Request, kBPSCSErrorInvalidParams,
 			TEXT("missing required string field 'property_name'"));
+	}
+	// Wave S+10: FName length guard.
+	{
+		FMCPResponse LenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("property_name"), PropertyName, LenErr)) { return LenErr; }
 	}
 
 	const TSharedPtr<FJsonValue> ValueField = Request.Args->TryGetField(TEXT("value"));

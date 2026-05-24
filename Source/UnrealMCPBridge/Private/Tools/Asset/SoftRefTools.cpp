@@ -253,6 +253,9 @@ FMCPResponse Tool_FindRedirectors(const FMCPRequest& Request)
 	Filter.bRecursivePaths   = true;
 	if (!PathPrefix.IsEmpty())
 	{
+		// Wave S+10: FName length guard on user-supplied path prefix.
+		FMCPResponse PrefixLenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("path_prefix"), PathPrefix, PrefixLenErr)) { return PrefixLenErr; }
 		Filter.PackagePaths.Add(FName(*PathPrefix));
 	}
 	TArray<FAssetData> Redirectors;
@@ -418,6 +421,9 @@ FMCPResponse Tool_FixRedirectors(const FMCPRequest& Request)
 	}
 	else
 	{
+		// Wave S+10: FName length guard on user-supplied path prefix.
+		FMCPResponse PrefixLenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("path_prefix"), PathPrefix, PrefixLenErr)) { return PrefixLenErr; }
 		FARFilter Filter;
 		Filter.ClassPaths.Add(UObjectRedirector::StaticClass()->GetClassPathName());
 		Filter.bRecursiveClasses = false;

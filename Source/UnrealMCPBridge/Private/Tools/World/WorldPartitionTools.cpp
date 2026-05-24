@@ -112,6 +112,12 @@ FMCPResponse Tool_SetActorRuntimeGrid(const FMCPRequest& Request)
 		return FMCPToolHelpers::MakeError(Request, kWPErrorInvalidParams,
 			TEXT("wp.set_actor_runtime_grid requires args.runtime_grid (string; empty to clear)"));
 	}
+	// Wave S+10: FName length guard (empty allowed = clear, only validate when non-empty).
+	if (!NewGrid.IsEmpty())
+	{
+		FMCPResponse GridLenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("runtime_grid"), NewGrid, GridLenErr)) { return GridLenErr; }
+	}
 
 	bool bAmbiguous = false;
 	FString AmbiguityHint, ResolveErr;

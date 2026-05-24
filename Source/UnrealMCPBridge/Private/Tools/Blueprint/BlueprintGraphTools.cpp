@@ -377,6 +377,13 @@ FMCPResponse Tool_AddNode(const FMCPRequest& Request)
 	Request.Args->TryGetStringField(TEXT("function_name"), FunctionName);
 	Request.Args->TryGetStringField(TEXT("function_class"), FunctionClassPath);
 	Request.Args->TryGetStringField(TEXT("event_name"), EventName);
+	// Wave S+10: FName length guards on each optional name field (used in FName(*X) below).
+	{
+		FMCPResponse LenErr;
+		if (!VariableName.IsEmpty() && !FMCPToolHelpers::ValidateFNameLength(Request, TEXT("variable_name"), VariableName, LenErr)) { return LenErr; }
+		if (!FunctionName.IsEmpty() && !FMCPToolHelpers::ValidateFNameLength(Request, TEXT("function_name"), FunctionName, LenErr)) { return LenErr; }
+		if (!EventName.IsEmpty() && !FMCPToolHelpers::ValidateFNameLength(Request, TEXT("event_name"), EventName, LenErr)) { return LenErr; }
+	}
 
 	if (UK2Node_VariableGet* VarGet = Cast<UK2Node_VariableGet>(NewNode))
 	{
@@ -481,6 +488,9 @@ FMCPResponse Tool_ConnectPins(const FMCPRequest& Request)
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("from_pin"),       FromPinName,   Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("to_node"),        ToNodeGuid,    Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("to_pin"),         ToPinName,     Err)) { return Err; }
+	// Wave S+10: FName length guards (pin names go through FName(*X) below).
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("from_pin"), FromPinName, Err)) { return Err; }
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("to_pin"),   ToPinName,   Err)) { return Err; }
 
 	FString GraphName = TEXT("EventGraph");
 	Request.Args->TryGetStringField(TEXT("graph_name"), GraphName);
@@ -606,6 +616,8 @@ FMCPResponse Tool_SetNodeProperty(const FMCPRequest& Request)
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("blueprint_path"),  BlueprintPath, Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("node_guid"),       NodeGuidStr,   Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("property_name"),   PropertyName,  Err)) { return Err; }
+	// Wave S+10: FName length guard.
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("property_name"), PropertyName, Err)) { return Err; }
 
 	const TSharedPtr<FJsonValue> ValueField = Request.Args->TryGetField(TEXT("value"));
 	if (!ValueField.IsValid())
@@ -722,6 +734,8 @@ FMCPResponse Tool_SetPinDefault(const FMCPRequest& Request)
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("node_guid"),      NodeGuidStr,   Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("pin_name"),       PinName,       Err)) { return Err; }
+	// Wave S+10: FName length guard.
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("pin_name"), PinName, Err)) { return Err; }
 
 	const TSharedPtr<FJsonValue> ValueField = Request.Args->TryGetField(TEXT("value"));
 	if (!ValueField.IsValid())
@@ -997,6 +1011,8 @@ FMCPResponse Tool_DisconnectPin(const FMCPRequest& Request)
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("node_guid"),      NodeGuidStr,   Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("pin_name"),       PinName,       Err)) { return Err; }
+	// Wave S+10: FName length guard.
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("pin_name"), PinName, Err)) { return Err; }
 
 	FString GraphName = TEXT("EventGraph");
 	Request.Args->TryGetStringField(TEXT("graph_name"), GraphName);
@@ -1720,6 +1736,8 @@ FMCPResponse Tool_AddMacroNode(const FMCPRequest& Request)
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			FString::Printf(TEXT("macro_path '%s' has empty package or graph part"), *MacroPath));
 	}
+	// Wave S+10: FName length guard — GraphPart is used to build FName(*GraphPart) below.
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("macro_path:graph_part"), GraphPart, Err)) { return Err; }
 
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
@@ -1977,9 +1995,14 @@ FMCPResponse Tool_BindComponentEvent(const FMCPRequest& Request)
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("component_name"), ComponentName, Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("delegate_name"),  DelegateName,  Err)) { return Err; }
+	// Wave S+10: FName length guards (all 3 used to build FName(*X) below).
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("component_name"), ComponentName, Err)) { return Err; }
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("delegate_name"),  DelegateName,  Err)) { return Err; }
 
 	FString TargetFunctionName;
 	Request.Args->TryGetStringField(TEXT("target_function_name"), TargetFunctionName);
+	// Optional field — validate only when non-empty.
+	if (!TargetFunctionName.IsEmpty() && !FMCPToolHelpers::ValidateFNameLength(Request, TEXT("target_function_name"), TargetFunctionName, Err)) { return Err; }
 
 	int32 PosX = 0, PosY = 0;
 	const TArray<TSharedPtr<FJsonValue>>* PositionArr = nullptr;

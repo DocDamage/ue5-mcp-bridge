@@ -71,6 +71,11 @@ namespace
 		{
 			return false;
 		}
+		// Wave S+10: FName length guard before constructing the FName.
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("parameter_name"), NameStr, OutError))
+		{
+			return false;
+		}
 		OutName = FName(*NameStr);
 		return true;
 	}
@@ -1348,6 +1353,12 @@ FMCPResponse Tool_AddExpression(const FMCPRequest& Request)
 
 	FString ParamName;
 	Request.Args->TryGetStringField(TEXT("parameter_name"), ParamName);
+	// Wave S+10: FName length guard (optional field, validate only when non-empty).
+	if (!ParamName.IsEmpty())
+	{
+		FMCPResponse LenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("parameter_name"), ParamName, LenErr)) { return LenErr; }
+	}
 
 	Material->Modify();
 	Material->PreEditChange(nullptr);
@@ -1552,6 +1563,8 @@ FMCPResponse Tool_SetExpressionParameter(const FMCPRequest& Request)
 	{
 		return Err;
 	}
+	// Wave S+10: FName length guard.
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("property_name"), PropertyName, Err)) { return Err; }
 
 	const TSharedPtr<FJsonValue> ValueField = Request.Args->TryGetField(TEXT("value"));
 	if (!ValueField.IsValid())

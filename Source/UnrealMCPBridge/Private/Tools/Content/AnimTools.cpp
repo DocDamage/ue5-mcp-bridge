@@ -294,6 +294,8 @@ FMCPResponse Tool_AddSection(const FMCPRequest& Request)
 	FMCPResponse Err;
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("montage_path"), MontagePath, Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("section_name"), SectionName, Err)) { return Err; }
+	// Wave S+10: FName length guard.
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("section_name"), SectionName, Err)) { return Err; }
 
 	double StartTime = 0.0;
 	if (!Request.Args->TryGetNumberField(TEXT("start_time"), StartTime))
@@ -346,6 +348,8 @@ FMCPResponse Tool_AddNotify(const FMCPRequest& Request)
 	FMCPResponse Err;
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("montage_path"), MontagePath, Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("notify_name"), NotifyName, Err)) { return Err; }
+	// Wave S+10: FName length guard.
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("notify_name"), NotifyName, Err)) { return Err; }
 
 	double Time = 0.0;
 	if (!Request.Args->TryGetNumberField(TEXT("time"), Time))
@@ -364,6 +368,11 @@ FMCPResponse Tool_AddNotify(const FMCPRequest& Request)
 
 	FString TrackName;
 	Request.Args->TryGetStringField(TEXT("notify_track_name"), TrackName);
+	// Wave S+10: FName length guard (optional field, validate only when non-empty).
+	if (!TrackName.IsEmpty())
+	{
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("notify_track_name"), TrackName, Err)) { return Err; }
+	}
 
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;

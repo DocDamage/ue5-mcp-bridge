@@ -69,6 +69,12 @@ namespace
 					FString::Printf(TEXT("package_paths entry '%s' is malformed"), *S));
 				return false;
 			}
+			// Wave S+10: FName length guard — Norm is later wrapped as FName(*S) in the 4 lambda
+			// call sites (find_unused / size_report / etc.) for FARFilter.PackagePaths.
+			if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("package_paths[]"), Norm, OutError))
+			{
+				return false;
+			}
 			OutNormalized.Add(Norm);
 		}
 		return true;

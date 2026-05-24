@@ -383,6 +383,17 @@ FMCPResponse Tool_SetRow(const FMCPRequest& Request)
 	for (const auto& FieldPair : ValuesObj->Values)
 	{
 		const FString& FieldName = FieldPair.Key;
+		// Wave S+10: FName length guard — UE FName::Init Fatal at >1023 chars. Skip + log to keep
+		// the partial-success semantics of the rest of the loop (FindPropertyByName would crash
+		// before returning null otherwise).
+		if (FieldName.Len() > 256)
+		{
+			++FieldsSkipped;
+			UE_LOG(LogMCP, Verbose,
+				TEXT("data_table.set_row: field name length %d exceeds 256-char cap on row '%s' — skipped"),
+				FieldName.Len(), *RowNameStr);
+			continue;
+		}
 		FProperty* FieldProp = RowStruct->FindPropertyByName(FName(*FieldName));
 		if (!FieldProp)
 		{

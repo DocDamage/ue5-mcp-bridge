@@ -850,6 +850,11 @@ namespace
 				TEXT("missing required string field 'function_name'"));
 			return false;
 		}
+		// Wave S+10: FName length guard — FName(*OutFnNameStr) constructed below at line 856.
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("function_name"), OutFnNameStr, OutError))
+		{
+			return false;
+		}
 		OutBlueprint = BP_ResolveBlueprintOrError(Request, OutPath, OutError);
 		if (!OutBlueprint) { return false; }
 
@@ -1245,6 +1250,11 @@ FMCPResponse Tool_GetFunction(const FMCPRequest& Request)
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'function_name'"));
 	}
+	// Wave S+10: FName length guard.
+	{
+		FMCPResponse LenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("function_name"), FnNameStr, LenErr)) { return LenErr; }
+	}
 
 	FMCPResponse ResolveErr;
 	UBlueprint* Blueprint = BP_ResolveBlueprintOrError(Request, Path, ResolveErr);
@@ -1313,6 +1323,11 @@ FMCPResponse Tool_ListNodesInFunction(const FMCPRequest& Request)
 	{
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'function_name'"));
+	}
+	// Wave S+10: FName length guard.
+	{
+		FMCPResponse LenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("function_name"), FnNameStr, LenErr)) { return LenErr; }
 	}
 
 	FMCPResponse ResolveErr;
@@ -1800,6 +1815,11 @@ FMCPResponse Tool_AddFunction(const FMCPRequest& Request)
 					FString::Printf(TEXT("%s[%d] missing 'name'"), FieldName, i));
 				return false;
 			}
+			// Wave S+10: FName length guard on per-pin name (separate field name for error context).
+			{
+				const FString PinFieldLabel = FString::Printf(TEXT("%s[%d].name"), FieldName, i);
+				if (!FMCPToolHelpers::ValidateFNameLength(Request, *PinFieldLabel, PinNameStr, OutError)) { return false; }
+			}
 			const TSharedPtr<FJsonObject>* PinTypeObjPtr = nullptr;
 			if (!Item->TryGetObjectField(TEXT("pin_type"), PinTypeObjPtr) || !PinTypeObjPtr || !PinTypeObjPtr->IsValid())
 			{
@@ -1931,6 +1951,11 @@ FMCPResponse Tool_RemoveFunction(const FMCPRequest& Request)
 	{
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'function_name'"));
+	}
+	// Wave S+10: FName length guard.
+	{
+		FMCPResponse LenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("function_name"), FnNameStr, LenErr)) { return LenErr; }
 	}
 
 	FMCPResponse ResolveErr;
@@ -2372,6 +2397,11 @@ FMCPResponse Tool_AddFunctionParameter(const FMCPRequest& Request)
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'param_name'"));
 	}
+	// Wave S+10: FName length guard.
+	{
+		FMCPResponse LenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("param_name"), ParamNameStr, LenErr)) { return LenErr; }
+	}
 
 	FString DirectionStr;
 	bool bIsInputDir = false;
@@ -2515,6 +2545,11 @@ FMCPResponse Tool_RemoveFunctionParameter(const FMCPRequest& Request)
 	{
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'param_name'"));
+	}
+	// Wave S+10: FName length guard.
+	{
+		FMCPResponse LenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("param_name"), ParamNameStr, LenErr)) { return LenErr; }
 	}
 
 	const FName ParamName(*ParamNameStr);
@@ -3404,6 +3439,9 @@ FMCPResponse Tool_SetVariableMetadata(const FMCPRequest& Request)
 			if (Metadata->TryGetStringField(TEXT("rep_notify_function"), RepNotifyFuncStr)
 				&& !RepNotifyFuncStr.IsEmpty())
 			{
+				// Wave S+10: FName length guard.
+				FMCPResponse LenErr;
+				if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("rep_notify_function"), RepNotifyFuncStr, LenErr)) { return LenErr; }
 				Var.RepNotifyFunc = FName(*RepNotifyFuncStr);
 			}
 			break;
@@ -3421,6 +3459,12 @@ FMCPResponse Tool_SetVariableMetadata(const FMCPRequest& Request)
 		FString RepNotifyFuncStr;
 		if (Metadata->TryGetStringField(TEXT("rep_notify_function"), RepNotifyFuncStr))
 		{
+			// Wave S+10: FName length guard (empty allowed = clear, only validate when non-empty).
+			if (!RepNotifyFuncStr.IsEmpty())
+			{
+				FMCPResponse LenErr;
+				if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("rep_notify_function"), RepNotifyFuncStr, LenErr)) { return LenErr; }
+			}
 			Blueprint->Modify();
 			Var.RepNotifyFunc = RepNotifyFuncStr.IsEmpty() ? NAME_None : FName(*RepNotifyFuncStr);
 			bAnyFlagChanged = true;

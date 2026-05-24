@@ -1104,6 +1104,9 @@ FMCPResponse Tool_AssetSearchByClass(const FMCPRequest& Request)
 				return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 					FString::Printf(TEXT("package_paths entry '%s' is malformed"), *S));
 			}
+			// Wave S+10: FName length guard on user-supplied package path.
+			FMCPResponse NormLenErr;
+			if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("package_paths[]"), Norm, NormLenErr)) { return NormLenErr; }
 			Filter.PackagePaths.Add(FName(*Norm));
 		}
 	}
@@ -1170,6 +1173,11 @@ FMCPResponse Tool_AssetSearchByTag(const FMCPRequest& Request)
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'tag_name'"));
 	}
+	// Wave S+10: FName length guard on user-supplied tag name (used in FName(*TagName) sites below).
+	{
+		FMCPResponse TagLenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("tag_name"), TagName, TagLenErr)) { return TagLenErr; }
+	}
 
 	// tag_value: nullable string. Empty / missing / explicit null = any-value match.
 	FString TagValue;
@@ -1194,6 +1202,9 @@ FMCPResponse Tool_AssetSearchByTag(const FMCPRequest& Request)
 				return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 					FString::Printf(TEXT("package_paths entry '%s' is malformed"), *S));
 			}
+			// Wave S+10: FName length guard (Norm is later passed to FName(*Scope) in HashFilter build).
+			FMCPResponse NormLenErr;
+			if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("package_paths[]"), Norm, NormLenErr)) { return NormLenErr; }
 			ScopePaths.Add(Norm);
 		}
 	}
@@ -1323,6 +1334,9 @@ FMCPResponse Tool_AssetSearchByName(const FMCPRequest& Request)
 				return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 					FString::Printf(TEXT("package_paths entry '%s' is malformed"), *S));
 			}
+			// Wave S+10: FName length guard on user-supplied package path.
+			FMCPResponse NormLenErr;
+			if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("package_paths[]"), Norm, NormLenErr)) { return NormLenErr; }
 			Filter.PackagePaths.Add(FName(*Norm));
 		}
 	}
@@ -1925,6 +1939,12 @@ FMCPResponse Tool_AssetCreate(const FMCPRequest& Request)
 	}
 	const FString PackagePath = FPaths::GetPath(DestPathNorm);
 	const FString AssetName   = FPaths::GetBaseFilename(DestPathNorm);
+	// Wave S+10: FName length guard — AssetName feeds FName(*AssetName) in the NewObject fallback
+	// path below; without the guard, a 1100-char user dest_path crashes UE at UnrealNames.cpp:3252.
+	{
+		FMCPResponse AssetNameLenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("dest_path (asset name)"), AssetName, AssetNameLenErr)) { return AssetNameLenErr; }
+	}
 
 	// Wave R dual existence check — disk + in-memory. See bp.create_blueprint for full rationale.
 	if (FPackageName::DoesPackageExist(DestPathNorm) ||

@@ -198,6 +198,11 @@ FMCPResponse Tool_CallFunction(const FMCPRequest& Request)
 		return FMCPToolHelpers::MakeError(Request, kUFNErrorInvalidParams,
 			TEXT("missing required string field 'function_name'"));
 	}
+	// Wave S+10: FName length guard.
+	{
+		FMCPResponse LenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("function_name"), FunctionName, LenErr)) { return LenErr; }
+	}
 
 	// Resolve target.
 	UClass* TargetClass = nullptr;

@@ -430,6 +430,9 @@ FMCPResponse Tool_Add(const FMCPRequest& Request)
 	FString DesiredNameStr;
 	if (Request.Args->TryGetStringField(TEXT("component_name"), DesiredNameStr) && !DesiredNameStr.IsEmpty())
 	{
+		// Wave S+10: FName length guard.
+		FMCPResponse NameLenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("component_name"), DesiredNameStr, NameLenErr)) { return NameLenErr; }
 		DesiredName = FName(*DesiredNameStr);
 	}
 
@@ -454,6 +457,9 @@ FMCPResponse Tool_Add(const FMCPRequest& Request)
 	USceneComponent* AttachParent = nullptr;
 	if (bAttachToProvided)
 	{
+		// Wave S+10: FName length guard.
+		FMCPResponse AttachLenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("attach_to"), AttachToStr, AttachLenErr)) { return AttachLenErr; }
 		TArray<USceneComponent*> SceneComps;
 		Actor->GetComponents(SceneComps);
 		const FName AttachToFName(*AttachToStr);

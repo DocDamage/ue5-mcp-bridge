@@ -441,6 +441,15 @@ namespace
 				OutError = TEXT("Name key requires a string value");
 				return false;
 			}
+			// Wave S+10: FName length guard — UE FName::Init asserts (Fatal) at >1023 chars.
+			// Cap at 256 to align with central FMCPToolHelpers::ValidateFNameLength policy.
+			if (S.Len() > 256)
+			{
+				OutError = FString::Printf(
+					TEXT("Name key value length %d exceeds 256-char cap (UE FName::Init Fatal at 1023)"),
+					S.Len());
+				return false;
+			}
 			BB.SetValueAsName(KeyName, FName(*S));
 			return true;
 		}
@@ -639,6 +648,8 @@ FMCPResponse Tool_GetValue(const FMCPRequest& Request)
 	FMCPResponse Err;
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("actor_path"), ActorPath, Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("key_name"), KeyName, Err)) { return Err; }
+	// Wave S+10: FName length guard on user-supplied key_name (used in FName(*KeyName) below).
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("key_name"), KeyName, Err)) { return Err; }
 
 	UBlackboardComponent* BB = AIBB_ResolveBlackboard(Request, ActorPath, Err);
 	if (!BB) { return Err; }
@@ -736,6 +747,8 @@ FMCPResponse Tool_SetValue(const FMCPRequest& Request)
 	FMCPResponse Err;
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("actor_path"), ActorPath, Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("key_name"), KeyName, Err)) { return Err; }
+	// Wave S+10: FName length guard on user-supplied key_name.
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("key_name"), KeyName, Err)) { return Err; }
 
 	// "value" must be present even when its JSON type is null (callers explicitly clearing an
 	// Object/Class key). HasField + GetField distinguishes "absent" (-32602) from "present null".
@@ -911,6 +924,8 @@ FMCPResponse Tool_AddKey(const FMCPRequest& Request)
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("bb_path"),  BBPath,  Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("key_name"), KeyName, Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("key_type"), KeyType, Err)) { return Err; }
+	// Wave S+10: FName length guard on user-supplied key_name.
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("key_name"), KeyName, Err)) { return Err; }
 
 	int32 LoadErr = 0;
 	FString LoadMsg;
@@ -1059,6 +1074,8 @@ FMCPResponse Tool_RemoveKey(const FMCPRequest& Request)
 	FMCPResponse Err;
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("bb_path"),  BBPath,  Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("key_name"), KeyName, Err)) { return Err; }
+	// Wave S+10: FName length guard on user-supplied key_name.
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("key_name"), KeyName, Err)) { return Err; }
 
 	int32 LoadErr = 0;
 	FString LoadMsg;

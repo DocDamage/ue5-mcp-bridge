@@ -615,6 +615,8 @@ FMCPResponse Tool_FixRedirectors(const FMCPRequest& Request)
 	FString NormalizedPath;
 	FMCPResponse Err;
 	if (!CB_RequirePath(Request, TEXT("path"), NormalizedPath, Err)) { return Err; }
+	// Wave S+10: FName length guard on user-supplied path.
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("path"), NormalizedPath, Err)) { return Err; }
 
 	bool bRecursive = true;
 	Request.Args->TryGetBoolField(TEXT("recursive"), bRecursive);

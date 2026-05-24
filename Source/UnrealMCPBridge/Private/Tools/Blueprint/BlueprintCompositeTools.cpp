@@ -119,6 +119,10 @@ FMCPResponse Tool_CompileAllDirtyInternal(const FMCPRequest& Request)
 		FString S;
 		if (V.IsValid() && V->TryGetString(S) && !S.IsEmpty())
 		{
+			// Wave S+10: FName length guard — S is later wrapped as FName(*S) in the lambda body
+			// for FARFilter.PackagePaths. Validate here on the listener thread before submit.
+			FMCPResponse ScopeLenErr;
+			if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("scope_paths[]"), S, ScopeLenErr)) { return ScopeLenErr; }
 			Scopes.Add(S);
 		}
 	}

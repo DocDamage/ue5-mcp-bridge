@@ -205,6 +205,8 @@ FMCPResponse Tool_GetWidgetProperty(const FMCPRequest& Request)
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("widget_bp_path"), Path, Err))      { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("widget_name"), WidgetName, Err))   { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("property_path"), PropertyPath, Err)) { return Err; }
+	// Wave S+10: FName length guard on widget_name.
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("widget_name"), WidgetName, Err)) { return Err; }
 
 	int32 ErrCode = 0;
 	FString ErrMsg;
@@ -417,6 +419,12 @@ FMCPResponse Tool_AddWidget(const FMCPRequest& Request)
 			TEXT("missing widget_bp_path / widget_class_path / widget_name"));
 	}
 	Request.Args->TryGetStringField(TEXT("parent_widget_name"), ParentName);
+	// Wave S+10: FName length guards on widget_name + parent_widget_name (latter optional).
+	{
+		FMCPResponse LenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("widget_name"), WidgetName, LenErr)) { return LenErr; }
+		if (!ParentName.IsEmpty() && !FMCPToolHelpers::ValidateFNameLength(Request, TEXT("parent_widget_name"), ParentName, LenErr)) { return LenErr; }
+	}
 
 	UWidgetBlueprint* WBP = LoadObject<UWidgetBlueprint>(nullptr, *WBPPath);
 	if (!WBP || !WBP->WidgetTree)
@@ -540,6 +548,11 @@ FMCPResponse Tool_RemoveWidget(const FMCPRequest& Request)
 		return FMCPToolHelpers::MakeError(Request, kUMGErrorInvalidParams,
 			TEXT("missing widget_bp_path or widget_name"));
 	}
+	// Wave S+10: FName length guard.
+	{
+		FMCPResponse LenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("widget_name"), WidgetName, LenErr)) { return LenErr; }
+	}
 
 	UWidgetBlueprint* WBP = LoadObject<UWidgetBlueprint>(nullptr, *WBPPath);
 	if (!WBP || !WBP->WidgetTree)
@@ -592,6 +605,11 @@ FMCPResponse Tool_SetWidgetProperty(const FMCPRequest& Request)
 	{
 		return FMCPToolHelpers::MakeError(Request, kUMGErrorInvalidParams,
 			TEXT("missing widget_bp_path / widget_name / property_path / value"));
+	}
+	// Wave S+10: FName length guard.
+	{
+		FMCPResponse LenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("widget_name"), WidgetName, LenErr)) { return LenErr; }
 	}
 
 	UWidgetBlueprint* WBP = LoadObject<UWidgetBlueprint>(nullptr, *WBPPath);
@@ -683,6 +701,13 @@ FMCPResponse Tool_BindWidgetEvent(const FMCPRequest& Request)
 	{
 		return FMCPToolHelpers::MakeError(Request, kUMGErrorInvalidParams,
 			TEXT("missing widget_bp_path / widget_name / event_name / function_name"));
+	}
+	// Wave S+10: FName length guards (each goes through FName(*X) downstream).
+	{
+		FMCPResponse LenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("widget_name"),   WidgetName,   LenErr)) { return LenErr; }
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("event_name"),    EventName,    LenErr)) { return LenErr; }
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("function_name"), FunctionName, LenErr)) { return LenErr; }
 	}
 
 	UWidgetBlueprint* WBP = LoadObject<UWidgetBlueprint>(nullptr, *WBPPath);

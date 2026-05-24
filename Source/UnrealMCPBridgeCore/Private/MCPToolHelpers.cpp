@@ -142,6 +142,28 @@ namespace FMCPToolHelpers
 		return true;
 	}
 
+	bool ValidateFNameLength(
+		const FMCPRequest& Request,
+		const TCHAR* FieldName,
+		const FString& Value,
+		FMCPResponse& OutError,
+		int32 MaxLen)
+	{
+		// Wave S+10 (2026-05-24): central guard against UE's hard FName::Init assert at
+		// NAME_SIZE-1 = 1023 chars. Cap at 256 (default) — leaves headroom for UE-prepended
+		// path prefixes when forming fully-qualified FNames. Matches S+6 BP-side cap.
+		if (Value.Len() > MaxLen)
+		{
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
+				FString::Printf(
+					TEXT("field '%s' length %d exceeds %d-char cap; UE FName limit "
+						 "(NAME_SIZE-1=1023) would be exceeded after path-prefix qualification"),
+					FieldName, Value.Len(), MaxLen));
+			return false;
+		}
+		return true;
+	}
+
 	int32 ApplyJsonProperties(
 		UObject* Target,
 		const TSharedPtr<FJsonObject>& Props,

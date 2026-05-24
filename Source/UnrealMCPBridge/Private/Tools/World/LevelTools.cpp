@@ -10,6 +10,7 @@
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
+#include "Utils/MCPAssetPathUtils.h"
 #include "Utils/MCPPageCursor.h"
 #include "Utils/MCPReflection.h"
 #include "Utils/MCPWorldContext.h"
@@ -835,6 +836,14 @@ FMCPResponse Tool_SetWorldSettings(const FMCPRequest& Request)
 			Rejected.Add(MakeRejected(Name, TEXT("not in writable subset")));
 			continue;
 		}
+		// Wave S+10: defensive FName length guard — whitelist above already constrains Name to short
+		// fixed strings, but if the whitelist is ever broadened the FName(*Name) below would crash
+		// at >1023 chars. Skip + reject preserves the loop's partial-success semantics.
+		if (Name.Len() > 256)
+		{
+			Rejected.Add(MakeRejected(Name, TEXT("property name exceeds 256-char FName cap")));
+			continue;
+		}
 		FProperty* Prop = SettingsClass->FindPropertyByName(FName(*Name));
 		if (!Prop)
 		{
@@ -1122,6 +1131,17 @@ FMCPResponse Tool_Duplicate(const FMCPRequest& Request)
 	{
 		return FMCPToolHelpers::MakeError(Request, kLVLErrorInvalidParams,
 			TEXT("source_map and dest_map must differ"));
+	}
+	// Wave S+12 (2026-05-24): writeable-mount guard on dest_map. NormaliseMapPath only checks the
+	// path starts with "/" — it does NOT reject /Engine, /Script, /Memory namespaces. Without this
+	// guard, level.duplicate can pollute engine-owned mounts (and /Memory triggers a Fatal in
+	// LongPackageNameToFilename). Aligns with Wave S+7 / S+11 sweep.
+	if (!FMCPAssetPathUtils::IsWriteableMountPoint(DstNorm))
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
+			FString::Printf(TEXT("dest_map '%s' is not a writeable content mount "
+				"(must be /Game/... or writable plugin content — /Engine, /Script, /Memory rejected)"),
+				*DstNorm));
 	}
 	if (!FPackageName::DoesPackageExist(SrcNorm))
 	{

@@ -197,6 +197,12 @@ FMCPResponse Tool_QueryActor(const FMCPRequest& Request)
 
 	FString PropertyName;
 	const bool bHasPropertyName = Request.Args->TryGetStringField(TEXT("property_name"), PropertyName) && !PropertyName.IsEmpty();
+	if (bHasPropertyName)
+	{
+		// Wave S+10: FName length guard.
+		FMCPResponse LenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("property_name"), PropertyName, LenErr)) { return LenErr; }
+	}
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("actor_path"), Actor->GetPathName());
@@ -273,6 +279,9 @@ FMCPResponse Tool_AddToContainer(const FMCPRequest& Request)
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("actor_path"),    ActorPath,    Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("property_name"), PropertyName, Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("tag"),           TagStr,       Err)) { return Err; }
+	// Wave S+10: FName length guards (property_name + tag both go through FName(*X) downstream).
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("property_name"), PropertyName, Err)) { return Err; }
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("tag"),           TagStr,       Err)) { return Err; }
 
 	bool bAmbiguous = false;
 	FString AmbiguityHint, ResolveErr;
@@ -337,6 +346,9 @@ FMCPResponse Tool_RemoveFromContainer(const FMCPRequest& Request)
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("actor_path"),    ActorPath,    Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("property_name"), PropertyName, Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("tag"),           TagStr,       Err)) { return Err; }
+	// Wave S+10: FName length guards (property_name + tag both go through FName(*X) downstream).
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("property_name"), PropertyName, Err)) { return Err; }
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("tag"),           TagStr,       Err)) { return Err; }
 
 	bool bAmbiguous = false;
 	FString AmbiguityHint, ResolveErr;

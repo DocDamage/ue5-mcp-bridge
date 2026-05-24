@@ -75,6 +75,39 @@ namespace FMCPToolHelpers
 	UNREALMCPBRIDGECORE_API bool RequireObjectField(const FMCPRequest& Request, const TCHAR* FieldName, const TSharedPtr<FJsonObject>*& OutObjectPtr, FMCPResponse& OutError);
 
 	/**
+	 * Wave S+10 (2026-05-24): centralized FName length validation.
+	 *
+	 * UE's `FName::Init` asserts (Fatal) when the source string length exceeds NAME_SIZE-1 = 1023
+	 * chars (see UnrealNames.cpp:3252 — `Length <= NAME_SIZE - 1`). The crash is unrecoverable and
+	 * brings down the editor process. UE prepends path prefixes when forming fully-qualified
+	 * FNames (e.g. `/Game/X/Y:PersistentLevel.<name>`), so the effective user-input budget is
+	 * ~767 chars after prefix accounting.
+	 *
+	 * We cap user-supplied FName strings at 256 chars — matches the S+6 cap used by
+	 * `bp.add_function` / `bp.add_variable`, leaves generous headroom for UE's prefix, and covers
+	 * every reasonable identifier in practice.
+	 *
+	 * **Contract:** call AFTER `RequireStringField` / `TryGetStringField` succeeds, BEFORE any
+	 * `FName(*Value)` construction. On failure: returns false, populates `OutError` with a -32602
+	 * InvalidParams error stating field name, actual length, and the cap.
+	 *
+	 * Usage:
+	 *     FString Name;
+	 *     if (!FMCPToolHelpers::RequireStringField(Req, TEXT("name"), Name, Err)) return Err;
+	 *     if (!FMCPToolHelpers::ValidateFNameLength(Req, TEXT("name"), Name, Err)) return Err;
+	 *     FName N(*Name);  // safe
+	 *
+	 * For optional-empty patterns (`Str.IsEmpty() ? NAME_None : FName(*Str)`), validate only when
+	 * non-empty — empty strings never reach `FName::Init`.
+	 */
+	UNREALMCPBRIDGECORE_API bool ValidateFNameLength(
+		const FMCPRequest& Request,
+		const TCHAR* FieldName,
+		const FString& Value,
+		FMCPResponse& OutError,
+		int32 MaxLen = 256);
+
+	/**
 	 * Apply a JSON properties dict to a UObject via FMCPReflection::WritePropertyValue.
 	 *
 	 * For each {key, value} in Props:

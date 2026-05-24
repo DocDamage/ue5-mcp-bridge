@@ -159,6 +159,8 @@ FMCPResponse Tool_FindFunctionCallsites(const FMCPRequest& Request)
 	FMCPResponse Err;
 	FString TargetFunctionStr;
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("target_function"), TargetFunctionStr, Err)) { return Err; }
+	// Wave S+10: FName length guard.
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("target_function"), TargetFunctionStr, Err)) { return Err; }
 	const FName TargetFunctionFName(*TargetFunctionStr);
 
 	// Optional target_class (per critique Q2 — supports both /Script/ native and /Game/ BP).

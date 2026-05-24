@@ -683,6 +683,9 @@ FMCPResponse Tool_Spawn(const FMCPRequest& Request)
 	FString DesiredName;
 	if (Request.Args->TryGetStringField(TEXT("name"), DesiredName) && !DesiredName.IsEmpty())
 	{
+		// Wave S+10: guard against FName::Init 1023-char assert (crash dump UECC-6FF8CA8A).
+		FMCPResponse NameLenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("name"), DesiredName, NameLenErr)) { return NameLenErr; }
 		Params.Name = FName(*DesiredName);
 		Params.NameMode = FActorSpawnParameters::ESpawnActorNameMode::Requested;
 	}
@@ -818,6 +821,9 @@ FMCPResponse Tool_Spawn(const FMCPRequest& Request)
 	FString FolderPath;
 	if (Request.Args->TryGetStringField(TEXT("spawn_in_folder"), FolderPath) && !FolderPath.IsEmpty())
 	{
+		// Wave S+10: FName length guard.
+		FMCPResponse FolderLenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("spawn_in_folder"), FolderPath, FolderLenErr)) { return FolderLenErr; }
 		NewActor->SetFolderPath(FName(*FolderPath));
 	}
 
@@ -829,7 +835,12 @@ FMCPResponse Tool_Spawn(const FMCPRequest& Request)
 		{
 			if (V.IsValid() && V->Type == EJson::String)
 			{
-				NewActor->Tags.Add(FName(*V->AsString()));
+				const FString TagStr = V->AsString();
+				if (TagStr.IsEmpty()) { continue; }
+				// Wave S+10: FName length guard on user-supplied tag strings.
+				FMCPResponse TagLenErr;
+				if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("tags[]"), TagStr, TagLenErr)) { return TagLenErr; }
+				NewActor->Tags.Add(FName(*TagStr));
 			}
 		}
 	}
@@ -1269,6 +1280,13 @@ FMCPResponse Tool_SetFolder(const FMCPRequest& Request)
 
 	const FString PrevFolder = Actor->GetFolderPath().ToString();
 
+	// Wave S+10: guard against FName 1023-char crash on empty/long folder strings.
+	// folder_path may be empty (clear-folder semantics) — only validate when non-empty.
+	if (!FolderPath.IsEmpty())
+	{
+		FMCPResponse FolderLenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("folder_path"), FolderPath, FolderLenErr)) { return FolderLenErr; }
+	}
 	Actor->SetFolderPath(FName(*FolderPath));
 
 	return FMCPJsonBuilder()
@@ -1358,6 +1376,9 @@ FMCPResponse Tool_Attach(const FMCPRequest& Request)
 	FString SocketStr;
 	if (Request.Args->TryGetStringField(TEXT("socket_name"), SocketStr) && !SocketStr.IsEmpty())
 	{
+		// Wave S+10: FName length guard.
+		FMCPResponse SocketLenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("socket_name"), SocketStr, SocketLenErr)) { return SocketLenErr; }
 		SocketName = FName(*SocketStr);
 	}
 

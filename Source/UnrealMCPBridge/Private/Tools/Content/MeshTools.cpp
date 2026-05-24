@@ -361,15 +361,27 @@ FMCPResponse Tool_Duplicate(const FMCPRequest& Request)
 	UStaticMesh* Source = FMCPAssetLoader::Load<UStaticMesh>(SourceRaw, LoadErrCode, LoadErrMsg);
 	if (!Source) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
+	// Wave S+11 (2026-05-24): swap IsValidGameOrPlugin -> IsWriteableMountPoint. The looser pre-S+7
+	// check let mesh.duplicate write into /Engine/, /Script/, /Memory/ mounts. /Memory destination
+	// triggers a Fatal in LongPackageNameToFilename. Aligns with the Wave S+7 sweep (see
+	// FMCPAssetFactory::Create).
 	const FString DestNorm = FMCPAssetPathUtils::Normalize(DestRaw);
-	if (DestNorm.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(DestNorm))
+	if (DestNorm.IsEmpty() || !FMCPAssetPathUtils::IsWriteableMountPoint(DestNorm))
 	{
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
-			FString::Printf(TEXT("dest_path '%s' malformed or unknown mount"), *DestRaw));
+			FString::Printf(TEXT("dest_path '%s' malformed or not a writeable content mount "
+				"(must be /Game/... or writable plugin content — /Engine, /Script, /Memory rejected)"),
+				*DestRaw));
 	}
 
 	const FString PackagePath = FPaths::GetPath(DestNorm);
 	const FString AssetName   = FPaths::GetBaseFilename(DestNorm);
+	// Wave S+10: FName length guard — AssetName feeds DuplicateObject<>(...,*AssetName) below;
+	// without the guard a 1100-char user dest_path crashes UE at UnrealNames.cpp:3252.
+	{
+		FMCPResponse AssetNameLenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("dest_path (asset name)"), AssetName, AssetNameLenErr)) { return AssetNameLenErr; }
+	}
 
 	// PathInUse: cover both on-disk and in-memory (matches sequencer.create_sequence pattern —
 	// double-create without this check silently overwrites the prior UObject).

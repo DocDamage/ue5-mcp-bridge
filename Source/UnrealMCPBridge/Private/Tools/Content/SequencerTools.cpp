@@ -562,6 +562,9 @@ FMCPResponse Tool_ListCinematics(const FMCPRequest& Request)
 					return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 						FString::Printf(TEXT("scope_paths entry '%s' is malformed"), *S));
 				}
+				// Wave S+10: FName length guard on user-supplied scope path.
+				FMCPResponse NormLenErr;
+				if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("scope_paths[]"), Norm, NormLenErr)) { return NormLenErr; }
 				Scope.Add(FName(*Norm));
 			}
 		}

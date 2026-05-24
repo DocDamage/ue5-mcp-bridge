@@ -427,6 +427,11 @@ FMCPResponse Tool_GetProperty(const FMCPRequest& Request)
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'property_name'"));
 	}
+	// Wave S+10: FName length guard.
+	{
+		FMCPResponse LenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("property_name"), PropertyName, LenErr)) { return LenErr; }
+	}
 
 	UClass* SubsystemClass = nullptr;
 	int32 ResolveErrCode = 0;
@@ -512,6 +517,11 @@ FMCPResponse Tool_CallFunction(const FMCPRequest& Request)
 	{
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'function_name'"));
+	}
+	// Wave S+10: FName length guard.
+	{
+		FMCPResponse LenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("function_name"), FunctionName, LenErr)) { return LenErr; }
 	}
 
 	UClass* SubsystemClass = nullptr;

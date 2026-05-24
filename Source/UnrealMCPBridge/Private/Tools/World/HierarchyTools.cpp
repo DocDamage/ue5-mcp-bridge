@@ -157,6 +157,12 @@ FMCPResponse Tool_Attach(const FMCPRequest& Request)
 	if (Request.Args.IsValid()) { Request.Args->TryGetBoolField(TEXT("weld_simulated_bodies"), bWeldSimulatedBodies); }
 
 	const FString SocketName = HRC_GetOptionalString(Request, TEXT("socket_name"));
+	// Wave S+10: FName length guard (empty allowed = no socket, only validate when non-empty).
+	if (!SocketName.IsEmpty())
+	{
+		FMCPResponse SockLenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("socket_name"), SocketName, SockLenErr)) { return SockLenErr; }
+	}
 	const FName SocketFName = SocketName.IsEmpty() ? NAME_None : FName(*SocketName);
 
 	// Capture prior parent for the response payload (helpful for diff visualization / undo UX).

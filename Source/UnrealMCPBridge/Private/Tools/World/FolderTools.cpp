@@ -143,6 +143,8 @@ FMCPResponse Tool_Create(const FMCPRequest& Request)
 	FString FolderPath;
 	FMCPResponse Err;
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("folder_path"), FolderPath, Err)) { return Err; }
+	// Wave S+10: FName length guard — FLDR_MakeWorldFolder builds FName(*FolderPath) inside.
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("folder_path"), FolderPath, Err)) { return Err; }
 
 	int32 ErrCode = 0;
 	FString ErrMsg;
@@ -183,6 +185,8 @@ FMCPResponse Tool_Delete(const FMCPRequest& Request)
 	FString FolderPath;
 	FMCPResponse Err;
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("folder_path"), FolderPath, Err)) { return Err; }
+	// Wave S+10: FName length guard — propagates into FLDR_MakeWorldFolder + ParentPath FName + descendant FName(*New).
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("folder_path"), FolderPath, Err)) { return Err; }
 
 	bool bMoveChildrenToParent = true;
 	if (Request.Args.IsValid())
@@ -292,6 +296,12 @@ FMCPResponse Tool_SetActor(const FMCPRequest& Request)
 	{
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("folder.set_actor requires args.folder_path (string; empty to move to root)"));
+	}
+	// Wave S+10: FName length guard (empty allowed = root, only validate when non-empty).
+	if (!FolderPath.IsEmpty())
+	{
+		FMCPResponse LenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("folder_path"), FolderPath, LenErr)) { return LenErr; }
 	}
 
 	bool bAmbiguous = false;

@@ -414,6 +414,12 @@ FMCPResponse Tool_SetPostProcessVolumeProperty(const FMCPRequest& Request)
 
 	// Field lookup. FPostProcessSettings::StaticStruct() returns the UScriptStruct we walk.
 	const FString FieldName = RND_NormalisePostProcessFieldName(PropertyPath);
+	// Wave S+10: FName length guard — FieldName feeds FName(*FieldName) below, plus the companion
+	// "bOverride_<FieldName>" lookup. Cap covers both with comfortable headroom under the 1023 limit.
+	{
+		FMCPResponse FieldLenErr;
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("property_path"), FieldName, FieldLenErr)) { return FieldLenErr; }
+	}
 	UScriptStruct* PPStruct = FPostProcessSettings::StaticStruct();
 	check(PPStruct != nullptr);
 	FProperty* Prop = PPStruct->FindPropertyByName(FName(*FieldName));
