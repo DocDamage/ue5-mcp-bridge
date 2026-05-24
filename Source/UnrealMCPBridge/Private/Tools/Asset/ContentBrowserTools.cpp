@@ -147,6 +147,14 @@ namespace FContentBrowserTools
 // ─── cb.create_folder ────────────────────────────────────────────────────────────────────────
 FMCPResponse Tool_CreateFolder(const FMCPRequest& Request)
 {
+	// Wave S+8 (2026-05-24): PIE guard. Without this, calling cb.create_folder during PIE
+	// returns -32000 "MakeDirectory failed (permissions?)" — confusing for callers. Match the
+	// canonical -32027 PIEActive error other write tools surface.
+	if (GEditor && GEditor->PlayWorld != nullptr)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+	}
+
 	FString NormalizedPath;
 	FMCPResponse Err;
 	if (!CB_RequirePath(Request, TEXT("path"), NormalizedPath, Err)) { return Err; }
