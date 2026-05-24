@@ -655,6 +655,10 @@ FMCPResponse Tool_SetUserParam(const FMCPRequest& Request)
 	FMCPResponse Err;
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("niagara_system_path"), Path, Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("name"),                Name, Err)) { return Err; }
+	// Wave S+15 (2026-05-24): cap name length before NIA_FindUserParamByName which does
+	// FName Target(*Name) + FName(*("User." + Name)). 2000-char name would crash editor at
+	// UnrealNames.cpp:3252. NiagaraTools was missed by the S+10 agent sweep.
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("name"), Name, Err)) { return Err; }
 
 	if (!Request.Args.IsValid() || !Request.Args->HasField(TEXT("value")))
 	{

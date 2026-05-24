@@ -283,6 +283,8 @@ FMCPResponse Tool_GetProfile(const FMCPRequest& Request)
 	FString ProfileNameStr;
 	FMCPResponse Err;
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("profile_name"), ProfileNameStr, Err)) { return Err; }
+	// Wave S+15: FName length guard — profile_name flows into FName ProfileName(*ProfileNameStr) below.
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("profile_name"), ProfileNameStr, Err)) { return Err; }
 
 	const UCollisionProfile* CP = UCollisionProfile::Get();
 	if (!CP)
@@ -353,6 +355,9 @@ FMCPResponse Tool_SetProfileResponse(const FMCPRequest& Request)
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("profile_name"), ProfileNameStr, Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("channel_name"), ChannelNameStr, Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("response"),     ResponseStr,    Err)) { return Err; }
+	// Wave S+15: FName length guards — both flow into FName(*X) below.
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("profile_name"), ProfileNameStr, Err)) { return Err; }
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("channel_name"), ChannelNameStr, Err)) { return Err; }
 
 	ECollisionResponse NewResponse;
 	if (!COLL_ParseResponse(ResponseStr, NewResponse))

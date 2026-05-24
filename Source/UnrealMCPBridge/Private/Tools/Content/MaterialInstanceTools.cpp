@@ -379,6 +379,8 @@ FMCPResponse Tool_SetScalarParam(const FMCPRequest& Request)
 	FMCPResponse Err;
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("instance_path"), InstancePath, Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("param_name"),    ParamNameStr, Err)) { return Err; }
+	// Wave S+15: FName length guard — param_name flows into FName ParamName(*ParamNameStr) below.
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("param_name"), ParamNameStr, Err)) { return Err; }
 
 	double ValueDouble = 0.0;
 	if (!FMCPToolHelpers::RequireNumberField(Request, TEXT("value"), ValueDouble, Err))
@@ -440,6 +442,8 @@ FMCPResponse Tool_SetVectorParam(const FMCPRequest& Request)
 	FMCPResponse Err;
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("instance_path"), InstancePath, Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("param_name"),    ParamNameStr, Err)) { return Err; }
+	// Wave S+15: FName length guard — param_name flows into FName ParamName(*ParamNameStr) below.
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("param_name"), ParamNameStr, Err)) { return Err; }
 
 	const TArray<TSharedPtr<FJsonValue>>* ValueArrPtr = nullptr;
 	if (!FMCPToolHelpers::RequireArrayField(Request, TEXT("value"), ValueArrPtr, Err))
@@ -504,6 +508,8 @@ FMCPResponse Tool_SetTextureParam(const FMCPRequest& Request)
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("instance_path"), InstancePath,    Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("param_name"),    ParamNameStr,    Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("texture_path"),  TexturePathRaw,  Err)) { return Err; }
+	// Wave S+15: FName length guard — param_name flows into FName ParamName(*ParamNameStr) below.
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("param_name"), ParamNameStr, Err)) { return Err; }
 
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;

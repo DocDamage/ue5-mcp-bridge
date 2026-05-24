@@ -45,6 +45,9 @@ namespace
 	{
 		FString Raw;
 		if (!FMCPToolHelpers::RequireStringField(Request, TEXT("package_path"), Raw, OutError)) { return false; }
+		// Wave S+15: FName length guard — package_path flows into FName RootName(*PackageName) at
+		// the AssetRegistry::GetDependencies / GetReferencers callsites.
+		if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("package_path"), Raw, OutError)) { return false; }
 
 		const FString Normalised = FMCPAssetPathUtils::Normalize(Raw);
 		if (Normalised.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(Normalised))

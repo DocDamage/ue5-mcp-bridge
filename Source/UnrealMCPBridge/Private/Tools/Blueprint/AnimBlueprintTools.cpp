@@ -107,6 +107,9 @@ namespace
 	UAnimGraphNode_StateMachine* ABP_FindStateMachineNodeByName(UAnimBlueprint* ABP, const FString& SMName)
 	{
 		if (!ABP) { return nullptr; }
+		// Wave S+15: defensive length cap — FName(*SMName) below would crash on >1023 chars.
+		// 256-char cap matches FMCPToolHelpers::ValidateFNameLength's default; no SM names approach this.
+		if (SMName.Len() > 256) { return nullptr; }
 		const FName Target(*SMName);
 		for (UEdGraph* Graph : ABP->FunctionGraphs)
 		{

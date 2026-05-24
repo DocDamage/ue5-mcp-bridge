@@ -109,6 +109,8 @@ namespace
 		if (!World) { return nullptr; }
 		const FString Norm = FMCPWorldContext::NormaliseMapPath(SublevelPath);
 		if (Norm.IsEmpty()) { return nullptr; }
+		// Wave S+15: defensive length cap — FName(*Norm) below would crash on >1023 chars.
+		if (Norm.Len() > 256) { return nullptr; }
 		const FName Target(*Norm);
 		for (ULevelStreaming* Streaming : World->GetStreamingLevels())
 		{
