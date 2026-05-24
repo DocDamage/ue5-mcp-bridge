@@ -327,6 +327,12 @@ FMCPResponse Tool_GetCVar(const FMCPRequest& Request)
 		return FMCPToolHelpers::MakeError(Request, kCFGErrorInvalidParams,
 			TEXT("missing required string field 'name'"));
 	}
+	// Wave S+13 (2026-05-24): IConsoleManager::FindConsoleObject(*Name) internally constructs an
+	// FName during lookup; passing a 2000+ char string crashes editor at UnrealNames.cpp:3252
+	// ("FName's 1023 max length exceeded"). Verified crash dump UECC-Windows-04A4E334... Cvar
+	// names are universally short — 256-char cap matches the S+10 helper's standard limit.
+	FMCPResponse NameLenErr;
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("name"), Name, NameLenErr)) { return NameLenErr; }
 
 	IConsoleManager& Mgr = IConsoleManager::Get();
 	IConsoleObject* Obj = Mgr.FindConsoleObject(*Name);
@@ -410,6 +416,11 @@ FMCPResponse Tool_SetCVar(const FMCPRequest& Request)
 		return FMCPToolHelpers::MakeError(Request, kCFGErrorInvalidParams,
 			TEXT("missing required string field 'name'"));
 	}
+	// Wave S+13 (2026-05-24): same FName-internal-crash guard as cfg.get_cvar (FindConsoleObject
+	// builds an FName during lookup — long names trip UnrealNames.cpp:3252 assert).
+	FMCPResponse SetNameLenErr;
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("name"), Name, SetNameLenErr)) { return SetNameLenErr; }
+
 	TSharedPtr<FJsonValue> InValue = Request.Args->TryGetField(TEXT("value"));
 	if (!InValue.IsValid() || InValue->IsNull())
 	{
