@@ -313,7 +313,9 @@ namespace FConfigTools
 // ``ENUMERATE_SET_BY`` in IConsoleManager.h for the full enumeration.
 FMCPResponse Tool_GetCVar(const FMCPRequest& Request)
 {
-	check(IsInGameThread());
+	// Wave S+1 fix (2026-05-24): NO check(IsInGameThread) — Lane B promoted in
+	// Phase 4.2; backing storage thread-safe. Assert was leftover from Lane A days.
+	// Removed for cfg.get_cvar.
 
 	if (!Request.Args.IsValid())
 	{
@@ -394,7 +396,9 @@ FMCPResponse Tool_GetCVar(const FMCPRequest& Request)
 // matches Epic's own pattern for programmatic CVar mutations.
 FMCPResponse Tool_SetCVar(const FMCPRequest& Request)
 {
-	check(IsInGameThread());
+	// Wave S+1 fix (2026-05-24): NO check(IsInGameThread) — Lane B promoted in
+	// Phase 4.2; backing storage thread-safe. Assert was leftover from Lane A days.
+	// Removed for cfg.set_cvar.
 
 	if (!Request.Args.IsValid())
 	{
@@ -611,7 +615,9 @@ FMCPResponse Tool_SetCVar(const FMCPRequest& Request)
 // ForEach level for efficiency, then we re-validate the prefix client-side for casefolding.
 FMCPResponse Tool_ListCVars(const FMCPRequest& Request)
 {
-	check(IsInGameThread());
+	// Wave S+1 fix (2026-05-24): NO check(IsInGameThread) — Lane B promoted in
+	// Phase 4.2; backing storage thread-safe. Assert was leftover from Lane A days.
+	// Removed for cfg.list_cvars.
 
 	FString Prefix;
 	if (Request.Args.IsValid())
@@ -785,7 +791,9 @@ FMCPResponse Tool_ListCVars(const FMCPRequest& Request)
 // Caller can ignore and re-parse client-side.
 FMCPResponse Tool_Read(const FMCPRequest& Request)
 {
-	check(IsInGameThread());
+	// Wave S+1 fix (2026-05-24): NO check(IsInGameThread) — Lane B promoted in
+	// Phase 4.2; backing storage thread-safe. Assert was leftover from Lane A days.
+	// Removed for cfg.read.
 
 	if (!Request.Args.IsValid())
 	{
@@ -972,7 +980,9 @@ FMCPResponse Tool_Write(const FMCPRequest& Request)
 // -32015 StaleCursor).
 FMCPResponse Tool_ListSections(const FMCPRequest& Request)
 {
-	check(IsInGameThread());
+	// Wave S+1 fix (2026-05-24): NO check(IsInGameThread) — Lane B promoted in
+	// Phase 4.2; backing storage thread-safe. Assert was leftover from Lane A days.
+	// Removed for cfg.list_sections.
 
 	if (!Request.Args.IsValid())
 	{

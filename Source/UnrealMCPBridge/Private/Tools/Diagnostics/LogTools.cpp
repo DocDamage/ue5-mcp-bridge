@@ -283,7 +283,9 @@ FMCPResponse Tool_SetCategoryVerbosity(const FMCPRequest& Request)
 // last category name emitted on this page.
 FMCPResponse Tool_ListCategories(const FMCPRequest& Request)
 {
-	check(IsInGameThread());
+	// Wave S+1 fix (2026-05-24): NO check(IsInGameThread()) — Lane B. FMCPLogStream snapshots
+	// are thread-safe per its class docstring (CanBeUsedOnAnyThread + EntriesLock). Same fix
+	// rationale as Tool_Clear above.
 
 	FString Prefix;
 	if (Request.Args.IsValid())
@@ -415,7 +417,11 @@ FMCPResponse Tool_ListCategories(const FMCPRequest& Request)
 // observable points.
 FMCPResponse Tool_Clear(const FMCPRequest& Request)
 {
-	check(IsInGameThread());
+	// Wave S+1 fix (2026-05-24): NO check(IsInGameThread()) — Tool_Clear is registered Lane B
+	// (worker-thread eligible) since FMCPLogStream::Clear() acquires EntriesLock and is documented
+	// thread-safe. The GT assertion was a leftover from Lane A days; left in place during Phase 4.2
+	// promotion, it crashed the editor on any worker-thread dispatch. Discovered via full-coverage
+	// auto-discovery test (417 methods).
 
 	const int32 PriorCount = FMCPLogStream::Get().Clear();
 
