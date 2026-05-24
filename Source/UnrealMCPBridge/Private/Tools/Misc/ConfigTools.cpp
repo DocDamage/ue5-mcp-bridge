@@ -1091,12 +1091,17 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	// No UObject access; no GEditor; no FScopedTransaction.
 	// cfg.write stays Lane A defensively — the Flush(false, IniPath) path writes to disk +
 	// interacts with other engine systems that may concurrently read GConfig from GT.
-	RegisterTool(TEXT("cfg.get_cvar"),      &Tool_GetCVar,       /*Lane B*/ true);
-	RegisterTool(TEXT("cfg.set_cvar"),      &Tool_SetCVar,       /*Lane B*/ true);
-	RegisterTool(TEXT("cfg.list_cvars"),    &Tool_ListCVars,     /*Lane B*/ true);
-	RegisterTool(TEXT("cfg.read"),          &Tool_Read,          /*Lane B*/ true);
+	// Wave S+2 fix (2026-05-24): all cfg.* tools REVERTED Lane B → Lane A. The Phase 4.2 promotion
+	// to Lane B was incorrect — IConsoleManager API + GConfig modifications assert IsInGameThread()
+	// internally (Core/HAL/ConsoleManager.cpp:1888). Discovered via full-coverage test: cfg.list_sections
+	// on worker thread crashed engine asserter (not our own — engine's deep internal check). Reverted
+	// here. cfg.write was already Lane A correctly.
+	RegisterTool(TEXT("cfg.get_cvar"),      &Tool_GetCVar,       /*Lane A*/ false);
+	RegisterTool(TEXT("cfg.set_cvar"),      &Tool_SetCVar,       /*Lane A*/ false);
+	RegisterTool(TEXT("cfg.list_cvars"),    &Tool_ListCVars,     /*Lane A*/ false);
+	RegisterTool(TEXT("cfg.read"),          &Tool_Read,          /*Lane A*/ false);
 	RegisterTool(TEXT("cfg.write"),         &Tool_Write,         /*Lane A*/ false);
-	RegisterTool(TEXT("cfg.list_sections"), &Tool_ListSections,  /*Lane B*/ true);
+	RegisterTool(TEXT("cfg.list_sections"), &Tool_ListSections,  /*Lane A*/ false);
 
 	UE_LOG(LogMCP, Log,
 		TEXT("Phase 6 Chunk C (Config/CVars): registered 6 cfg.* sync handlers ")
