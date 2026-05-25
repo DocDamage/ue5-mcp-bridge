@@ -33,40 +33,52 @@ class_path → UE FTopLevelAssetPath ensure spam → editor destabilisation)
 that is fixed in S+16. Subsequent runs are clean; no crashes through
 full A1+A2+A3+A4+A5+A6+A7 sweep.
 
-| Phase | Script | LOC | Coverage | Result (polished) |
+| Phase | Script | LOC | Coverage | Result |
 |---|---|---|---|---|
-| A1 | phase_a1_inventory.py | 220 | 431 methods × 1 dispatch each | 431/431 PASS |
-| A2 | phase_a2_required_args.py | 280 | 312 methods × 3-5 hostile probes (≈1500 cases) | All PASS (--limit 100 verified 484P/0F/11X) |
-| A3 | phase_a3_optional_defaults.py | 220 | 312 methods × 2 (minimal + extras) | 100P/0F (--limit 50; all 11 coverage gaps closed via dummy_value polish) |
-| A4 | phase_a4_type_coercion.py | 225 | 312 methods × 2-3 coerce probes | 157P/0F (--limit 50) |
-| A5 | phase_a5_roundtrip.py | 320 | 7 curated write→read pairs | 5P/0F/2X (2 XFAIL = abstract DataAsset class; ai.bb runtime needs PIE) |
-| A6 | phase_a6_pagination.py | 240 | 19 paginated tools | 32P/0F/11X (11 = tools rejected as not-paginated or missing) |
-| A7 | phase_a7_error_codes.py | 235 | 17 documented error codes | 8P/0F/6X/3S (X = documented limitations) |
+| A1 | phase_a1_inventory.py | 220 | 431 methods × 1 dispatch | **431/431 PASS** (2m09s) |
+| A2 | phase_a2_required_args.py | 295 | 312 methods × 3-5 hostile probes (≈1200 cases) | **1197P / 0F / 3X** full sweep (7m26s) — was 696F before hybrid |
+| A3 | phase_a3_optional_defaults.py | 235 | 312 methods × 2 (minimal + extras) | 181P / 59F (--limit 150) — 59F = chain-incomplete methods (live fallback finds only 1 field) |
+| A4 | phase_a4_type_coercion.py | 240 | 312 methods × 2-3 coerce probes | 157P / 0F (--limit 50 last validated) |
+| A5 | phase_a5_roundtrip.py | 320 | 7 curated write→read pairs | **5P / 0F / 2X** |
+| A6 | phase_a6_pagination.py | 240 | 19 paginated tools | **32P / 0F / 11X** |
+| A7 | phase_a7_error_codes.py | 240 | 17 documented error codes | **8P / 0F / 6X / 3S** |
 
-## --limit N flag (RECOMMENDED FOR LOCAL RUNS)
+## A2 full sweep — FIXED via hybrid static+live chain discovery
 
-A2/A3/A4 accept `--limit N` to restrict the run to the first N methods.
+The original chain-walker saturated Lane A by satisfying required-arg
+validators with dummies, which let handlers RUN TO COMPLETION on every
+method (~1500 Lane A mutations × 312 methods = editor queue death after
+~150 methods). Full sweep was 88 min / 696 FAIL.
+
+**Fix**: `discover_chains_static()` in mcp_test_harness.py parses .cpp
+source for `RequireXxxField` sites (incl. surface-specific
+`XXX_Require*` helpers via inline expansion), brace-matched function
+bodies, file-aware keying to disambiguate handler name collisions
+(`Tool_Dump` in MemReport and RenderTarget).
+
+A2 stage 1 now uses static chains for the 168 methods source-parse
+covers fully + single-shot live probe (no satisfying-continuing) for
+the remaining 143. Stage 1 went from ~1500 live calls to ~143.
+
+**Result**: A2 full 312-method sweep — **1197 PASS / 0 FAIL / 3 XFAIL /
+1200 cases in 7m26s**. Editor alive throughout, zero crash dumps.
+
+## --limit N for A3/A4 (still recommended)
+
+A3 (`optional_defaults`) and A4 (`type_coercion`) test the WHOLE
+method response, which means they call the handler with full satisfied
+args — handler runs to completion → side effects → saturation, same as
+A2's old walker. With hybrid chain discovery providing partial chains
+(only first field for some methods), A3 also reports `coverage_gaps`
+where chain is incomplete.
 
 ```
-python phase_a2_required_args.py --limit 100
+python phase_a3_optional_defaults.py --limit 150
+python phase_a4_type_coercion.py --limit 100
 ```
 
-**Why --limit matters**: chain-walker discovery satisfies required fields
-with safe dummy values, which means the handler RUNS to completion once
-per method (creating side-effects: actors, folders, transient packages,
-etc.). After ~150 methods of accumulated side-effects, the editor's Lane
-A dispatch queue starts timing out (UObject count climbs, GC pressure
-mounts). The full 312-method sweep takes ~90 minutes and observed
-**63 PASS / 696 FAIL** (all FAILs are 6-second TCP socket_died timeouts
-post-saturation; editor stays alive=True throughout).
-
-The --limit 100 path delivers 484 PASS / 0 FAIL / 11 XFAIL in ~4 minutes
-on a fresh editor. Use that for routine validation.
-
-For a true full sweep, future work needs one of:
-- Static chain discovery from source-parse only (no live calls)
-- Mid-sweep cleanup (`force_gc()` + delete `/Game/PhT_*` every 50 methods)
-- Spread across multiple editor restarts (CI-friendly)
+Editor restart between A3 and A4/A5/A6/A7 is currently needed in the
+full sequential sweep.
 
 ## Findings
 
