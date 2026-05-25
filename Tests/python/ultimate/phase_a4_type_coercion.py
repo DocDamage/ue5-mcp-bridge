@@ -62,7 +62,7 @@ PHASE = "a4"
 NAME = "type_coercion"
 
 RE_MISSING = re.compile(
-    r"missing(?: or empty)? required (\w+) field '([A-Za-z0-9_]+)'",
+    r"missing(?: or empty)? required (?:(?:non-empty|valid|numeric) )?(\w+)?\s*field '([A-Za-z0-9_]+)'",
     re.IGNORECASE,
 )
 
@@ -121,7 +121,8 @@ def discover_chain_keepalive(conn: Connection, method: str) -> List[Tuple[str, s
         m = RE_MISSING.search(err_message(r) or "")
         if not m:
             break
-        typ, field = m.group(1).lower(), m.group(2)
+        typ = (m.group(1) or "string").lower()
+        field = m.group(2)
         if field in seen:
             break
         seen.add(field)

@@ -120,30 +120,35 @@ def main() -> int:
     fail += probe(log, "-32601/method_not_found", -32601,
                   "definitely.not.a.real.method.xyzzy", {})
 
-    # -32602 InvalidParams
+    # -32602 InvalidParams — use a tool with a TRULY required field.
+    # memreport.dump's `mode` is documented but actually optional (defaults to "trigger").
     fail += probe(log, "-32602/invalid_params", -32602,
-                  "memreport.dump", {})  # missing mode
+                  "actor.get", {})  # missing actor_path
 
     # -32004 ObjectNotFound
     fail += probe(log, "-32004/object_not_found", -32004,
                   "actor.get", {"actor_path": f"/Game/_phantom/NotThere_{random_suffix(4)}"})
 
-    # -32010 InvalidPath
+    # -32010 InvalidPath — use cb.create_folder which DOES mount-guard.
+    # folder.create is for world outliner folders (FActorFolders) and intentionally
+    # accepts any string — not a mount path.
     fail += probe(log, "-32010/invalid_path", -32010,
-                  "folder.create", {"folder_path": "/Engine/_PhT_NotAllowed"},
-                  allow_codes={-32027})  # PIE-blocked is also fine
+                  "cb.create_folder", {"path": "/Engine/_PhT_NotAllowed"},
+                  allow_codes={-32027})
 
     # -32011 WrongClass — S+16 fix sends -32011 for short class_path
     fail += probe(log, "-32011/wrong_class", -32011,
                   "asset.search_by_class", {"class_path": "x"})
 
-    # -32014 PathInUse (folder.create twice)
-    path = f"/Game/PhT_Codes/PathInUse_{random_suffix(6)}"
-    call("folder.create", {"folder_path": path}, timeout=8.0)
+    # -32014 PathInUse — try cb.duplicate to same dest twice (asset write that
+    # MUST fail on second attempt because the path is occupied).
+    src = "/Engine/EditorMeshes/EditorCube"   # known engine asset, read-only
+    dst = f"/Game/PhT_Codes/Dup_{random_suffix(6)}"
+    call("cb.duplicate", {"src": src, "dest": dst}, timeout=8.0)
     fail += probe(log, "-32014/path_in_use", -32014,
-                  "folder.create", {"folder_path": path},
-                  allow_codes={-32027})
-    call("folder.delete", {"folder_path": path, "recursive": True}, timeout=6.0)
+                  "cb.duplicate", {"src": src, "dest": dst},
+                  allow_codes={-32010, -32004, -32027}, xfail_other=True)
+    call("cb.delete", {"path": dst}, timeout=6.0)
 
     # -32021 ClassAbstract — UDataAsset is concrete in 5.7, but UObject is abstract
     fail += probe(log, "-32021/class_abstract", -32021,

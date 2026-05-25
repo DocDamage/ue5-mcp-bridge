@@ -61,10 +61,14 @@ from mcp_test_harness import (
 PHASE = "a2"
 NAME = "required_args"
 
-# Parse: "missing required string field 'name'" OR
-#        "missing or empty required array field 'items'"
+# Parse the family of "missing required ..." error messages:
+#   "missing required string field 'name'"
+#   "missing or empty required array field 'items'"
+#   "missing required non-empty string field 'tag'"
+#   "missing required field 'value' (use JSON null to clear ...)"  (no type)
+# Captures: (type-or-empty, field-name).
 RE_MISSING = re.compile(
-    r"missing(?: or empty)? required (\w+) field '([A-Za-z0-9_]+)'",
+    r"missing(?: or empty)? required (?:(?:non-empty|valid|numeric) )?(\w+)?\s*field '([A-Za-z0-9_]+)'",
     re.IGNORECASE,
 )
 
@@ -137,7 +141,10 @@ def parse_first_missing(resp: dict) -> Optional[Tuple[str, str]]:
     m = RE_MISSING.search(msg)
     if not m:
         return None
-    return (m.group(1).lower(), m.group(2))
+    # Type may be absent in "missing required field 'X'" — fall back to "string"
+    # (best guess; chain walker treats it as a generic field).
+    typ = (m.group(1) or "string").lower()
+    return (typ, m.group(2))
 
 
 def discover_required_chain(method: str, conn: "Connection" = None) -> List[Tuple[str, str]]:

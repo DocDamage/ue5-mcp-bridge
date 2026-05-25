@@ -710,23 +710,83 @@ def _dummy_string_for_field(field: str) -> str:
     return "x"
 
 
+# Vector/rotator/scale field-name hints. When the field name suggests a
+# 3-element geometric tuple, dummy_value() returns [0,0,0] / {x:0,y:0,z:0}
+# instead of ["x"] / {"k":"v"}. Avoids "must be [x,y,z]" rejections that
+# the simpler dummies trigger.
+_VECTOR_FIELDS = {
+    "location", "loc", "position", "pos", "origin", "translation",
+    "min", "max", "center", "end", "start", "direction", "dir",
+    "target", "target_location", "target_position", "target_pos",
+    "world_location", "relative_location",
+}
+_ROTATOR_FIELDS = {
+    "rotation", "rot", "rotator", "orientation",
+    "world_rotation", "relative_rotation",
+}
+_SCALE_FIELDS = {
+    "scale", "scale_3d", "size", "extent",
+    "world_scale", "relative_scale",
+}
+
+# Known enum/string-with-fixed-values fields. Use a known-valid value so
+# the chain walker can satisfy the field and move on to discover the
+# next required arg.
+_ENUM_HINTS: Dict[str, str] = {
+    "key_type": "Float",          # ai.bb.add_key
+    "quality": "High",            # ai.crowd.set_avoidance_quality
+    "verbosity": "Log",           # log.set_category_verbosity
+    "value_type": "Boolean",      # input.create_input_action
+    "mode": "trigger",            # memreport.dump et al
+    "world": "editor",            # many "world" enum fields
+    "axis": "X",                  # axis enum
+    "delivery_type": "Slashing",  # melee delivery type
+    "fire_mode": "SemiAuto",      # weapon fire mode
+    "fire_delivery": "Projectile",
+}
+
+
 def dummy_value(typ: str, field: str = "") -> Any:
     """Returns a safe dummy value for a (type, field-name) pair.
 
     Designed so that any required-arg probe satisfies the validator without
-    triggering UE-internal ensure() handlers (e.g. FTopLevelAssetPath).
+    triggering UE-internal ensure() handlers (e.g. FTopLevelAssetPath) AND
+    without tripping shape validators (vector/rotator x/y/z enforcement).
     """
     t = typ.lower()
+    fl = field.lower()
     if t in ("string",):
+        # Enum hint takes priority over path heuristic
+        if fl in _ENUM_HINTS:
+            return _ENUM_HINTS[fl]
         return _dummy_string_for_field(field)
     if t in ("number", "int", "uint", "float", "double"):
+        # Many APIs require >0 for size/radius/count fields. Default 0 trips
+        # those validators ("'radius' must be > 0"). Return 1 for known
+        # positive-only fields.
+        if fl in {"radius", "size", "width", "height", "count", "depth",
+                  "length", "rows", "cols", "pages", "page_size", "limit",
+                  "max_count", "thickness", "duration"}:
+            return 1
         return 0
     if t in ("bool",):
         return False
     if t in ("array",):
-        return ["x"]
+        # Vector/rotator/scale arrays expect 3 numeric elements
+        if fl in _VECTOR_FIELDS or fl in _ROTATOR_FIELDS:
+            return [0, 0, 0]
+        if fl in _SCALE_FIELDS:
+            return [1, 1, 1]
+        return [0, 0, 0]  # safe default — 3 elements satisfies most shape checks
     if t in ("object",):
-        return {"k": "v"}
+        # Vector-object form: { x, y, z }
+        if fl in _VECTOR_FIELDS:
+            return {"x": 0, "y": 0, "z": 0}
+        if fl in _ROTATOR_FIELDS:
+            return {"pitch": 0, "yaw": 0, "roll": 0}
+        if fl in _SCALE_FIELDS:
+            return {"x": 1, "y": 1, "z": 1}
+        return {"x": 0, "y": 0, "z": 0}  # 3-key default
     return "x"
 
 # ============================================================================

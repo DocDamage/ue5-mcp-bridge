@@ -76,8 +76,9 @@ def discover_chain(method: str) -> List[Tuple[str, str]]:
     """Same logic as A2 chain discovery — short version inlined here so A3 is
     self-contained when A2 hasn't run."""
     import re
+    # See phase_a2_required_args.py for the full regex rationale.
     RE_MISSING = re.compile(
-        r"missing(?: or empty)? required (\w+) field '([A-Za-z0-9_]+)'",
+        r"missing(?: or empty)? required (?:(?:non-empty|valid|numeric) )?(\w+)?\s*field '([A-Za-z0-9_]+)'",
         re.IGNORECASE,
     )
     chain: List[Tuple[str, str]] = []
@@ -90,7 +91,8 @@ def discover_chain(method: str) -> List[Tuple[str, str]]:
         m = RE_MISSING.search(err_message(r) or "")
         if not m:
             break
-        typ, field = m.group(1).lower(), m.group(2)
+        typ = (m.group(1) or "string").lower()
+        field = m.group(2)
         if field in seen:
             break
         seen.add(field)
