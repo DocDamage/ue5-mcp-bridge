@@ -49,6 +49,7 @@ from mcp_test_harness import (
     TestLogger,
     call,
     cleanup_phantom_assets,
+    discover_chains_static,
     dummy_value,
     err_code,
     err_message,
@@ -74,33 +75,34 @@ def baseline_args_from_chain(chain: List[Tuple[str, str]]) -> Dict[str, Any]:
     return {f: dummy_value(t, f) for (t, f) in chain}
 
 
+# Reuses harness's static chain discovery + single-shot live fallback.
+_STATIC_CHAINS: Optional[Dict[str, List[Tuple[str, str]]]] = None
+
+
 def discover_chain(method: str) -> List[Tuple[str, str]]:
-    """Same logic as A2 chain discovery — short version inlined here so A3 is
-    self-contained when A2 hasn't run."""
+    """Hybrid chain discovery — prefer static source-parse, fall back to one
+    live probe for first-missing-field. See A2 for the same pattern.
+    """
+    global _STATIC_CHAINS
+    if _STATIC_CHAINS is None:
+        _STATIC_CHAINS = discover_chains_static()
+    sc = _STATIC_CHAINS.get(method, [])
+    if sc:
+        return sc
+    # Fallback: one live call to find first required field
     import re
-    # See phase_a2_required_args.py for the full regex rationale.
     RE_MISSING = re.compile(
         r"missing(?: or empty)? required (?:(?:non-empty|valid|numeric) )?(\w+)?\s*field '([A-Za-z0-9_]+)'",
         re.IGNORECASE,
     )
-    chain: List[Tuple[str, str]] = []
-    args: Dict[str, Any] = {}
-    seen: set = set()
-    for _ in range(12):
-        r = call(method, args, timeout=6.0)
-        if err_code(r) != -32602:
-            break
-        m = RE_MISSING.search(err_message(r) or "")
-        if not m:
-            break
-        typ = (m.group(1) or "string").lower()
-        field = m.group(2)
-        if field in seen:
-            break
-        seen.add(field)
-        chain.append((typ, field))
-        args[field] = dummy_value(typ, field)
-    return chain
+    r = call(method, {}, timeout=4.0)
+    if err_code(r) != -32602:
+        return []
+    m = RE_MISSING.search(err_message(r) or "")
+    if not m:
+        return []
+    typ = (m.group(1) or "string").lower()
+    return [(typ, m.group(2))]
 
 
 def main() -> int:

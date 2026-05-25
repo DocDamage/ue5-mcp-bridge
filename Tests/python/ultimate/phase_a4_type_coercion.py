@@ -50,6 +50,7 @@ from mcp_test_harness import (
     TestLogger,
     call,
     cleanup_phantom_assets,
+    discover_chains_static,
     dummy_value,
     err_code,
     err_message,
@@ -111,26 +112,32 @@ COERCE: Dict[str, List[Tuple[str, Any, str]]] = {
 }
 
 
+# Static chain cache, populated lazily at first use.
+_STATIC_CHAINS: Optional[Dict[str, List[Tuple[str, str]]]] = None
+
+
 def discover_chain_keepalive(conn: Connection, method: str) -> List[Tuple[str, str]]:
-    """Like A2/A3 chain walker, but reuses one socket."""
-    chain: List[Tuple[str, str]] = []
-    args: Dict[str, Any] = {}
-    seen: set = set()
-    for _ in range(12):
-        r = conn.call_keepalive(method, args, timeout=6.0)
-        if err_code(r) != -32602:
-            break
-        m = RE_MISSING.search(err_message(r) or "")
-        if not m:
-            break
-        typ = (m.group(1) or "string").lower()
-        field = m.group(2)
-        if field in seen:
-            break
-        seen.add(field)
-        chain.append((typ, field))
-        args[field] = dummy_value(typ, field)
-    return chain
+    """Hybrid chain discovery — static source-parse first, single live probe
+    fallback. Avoids Lane A queue saturation when chain walker would
+    otherwise call handlers to completion. See A2 for full rationale.
+    """
+    global _STATIC_CHAINS
+    if _STATIC_CHAINS is None:
+        _STATIC_CHAINS = discover_chains_static()
+    sc = _STATIC_CHAINS.get(method, [])
+    if sc:
+        return sc
+    # Fallback: one live call to find first required field
+    try:
+        r = conn.call_keepalive(method, {}, timeout=4.0)
+    except Exception:
+        return []
+    if err_code(r) != -32602:
+        return []
+    m = RE_MISSING.search(err_message(r) or "")
+    if not m:
+        return []
+    return [((m.group(1) or "string").lower(), m.group(2))]
 
 
 def classify_outcome(r: Dict[str, Any]) -> str:

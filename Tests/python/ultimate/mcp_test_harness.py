@@ -491,10 +491,20 @@ def discover_required_args(src_root: Path = PLUGIN_SRC_ROOT) -> Dict[str, List[T
 
     Note: handler is the C++ function name (e.g. "Tool_Spawn") NOT the registered
     method name — caller must correlate via discover_methods()'s 'handler' key.
+
+    Also expands surface-specific helper functions (e.g. BP_RequireBlueprintPath,
+    PKG_RequirePackagePath, AR_RequirePath, CMP_RequireComponentPath) so that
+    methods using them get the underlying RequireXxxField fields too.
     """
-    by_handler: Dict[str, List[Tuple[str, str]]] = {}
-    current_handler: Optional[str] = None
-    _RE_FUNC_DEF = re.compile(r'^\s*(?:static\s+)?(?:FMCPResponse\s+|void\s+|FMCPResponse\s*&\s+)?(Tool_[A-Za-z0-9_]+)\s*\(', re.MULTILINE)
+    # ── Pass 1: build helper registry (XXX_RequireYyy → underlying fields) ─
+    # Each surface-specific helper wraps one or more FMCPToolHelpers::RequireXxxField
+    # calls. We parse helper bodies and record their effective contribution.
+    _RE_HELPER_DEF = re.compile(
+        r'^\s*(?:static\s+)?bool\s+([A-Z][A-Za-z0-9_]*_Require[A-Za-z0-9_]+)\s*\(',
+        re.MULTILINE,
+    )
+    helpers: Dict[str, List[Tuple[str, str]]] = {}
+    file_texts: Dict[Path, str] = {}
     for root, _dirs, files in os.walk(src_root):
         for fn in files:
             if not fn.endswith(".cpp"):
@@ -504,26 +514,133 @@ def discover_required_args(src_root: Path = PLUGIN_SRC_ROOT) -> Dict[str, List[T
                 text = p.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            # Walk line by line, tracking current Tool_X function context.
-            for line in text.splitlines():
-                fm = _RE_FUNC_DEF.match(line)
-                if fm:
-                    current_handler = fm.group(1)
-                    continue
-                rm = _RE_REQUIRE_ARG.search(line)
-                if rm and current_handler:
+            file_texts[p] = text
+            # Find helper definitions
+            for m in _RE_HELPER_DEF.finditer(text):
+                helper_name = m.group(1)
+                # Body is approximated as the next ~30 lines (one helper fn)
+                start = m.end()
+                # Slice ~40 lines after the def — most Require* helpers are tiny
+                body_lines = text[start:].splitlines()[:40]
+                body = "\n".join(body_lines)
+                for rm in _RE_REQUIRE_ARG.finditer(body):
                     typ, field = rm.group(1).lower(), rm.group(2)
-                    by_handler.setdefault(current_handler, []).append((field, typ))
-    # Dedup per handler
-    for h, pairs in by_handler.items():
+                    helpers.setdefault(helper_name, []).append((field, typ))
+
+    _RE_HELPER_CALL = re.compile(
+        r'\b([A-Z][A-Za-z0-9_]*_Require[A-Za-z0-9_]+)\s*\(',
+    )
+
+    # ── Pass 2: for each Tool_X function, scan its actual body via brace
+    # matching. Key by (file_relative_path, handler_name) to disambiguate
+    # collisions (e.g. memreport.dump and render_target.dump both define
+    # Tool_Dump — same handler name, different files).
+    _RE_TOOL_SIG = re.compile(
+        r'\b(?:FMCPResponse\s+|void\s+)?(Tool_[A-Za-z0-9_]+)\s*\(\s*(?:const\s+)?FMCPRequest',
+        re.MULTILINE,
+    )
+    # Per-file-and-handler chains so we can disambiguate Tool_Dump in
+    # MemReportTools.cpp vs RenderTargetTools.cpp.
+    by_file_handler: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
+    # All (file, handler) pairs seen — even those with no Require* calls —
+    # so collision detection knows about ALL Tool_Dump occurrences.
+    all_pairs: set = set()
+    for p, text in file_texts.items():
+        rel = str(p.relative_to(src_root)).replace("\\", "/")
+        for m in _RE_TOOL_SIG.finditer(text):
+            handler = m.group(1)
+            all_pairs.add((rel, handler))
+            # Find '{' that opens this function body
+            after_sig = text[m.end():]
+            brace_open = after_sig.find('{')
+            if brace_open < 0:
+                continue
+            body_start = m.end() + brace_open + 1
+            # Count braces forward until we close the function
+            depth = 1
+            i = body_start
+            while i < len(text) and depth > 0:
+                c = text[i]
+                if c == '{':
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            body = text[body_start:i]
+            key = (rel, handler)
+            # Direct RequireXxxField calls
+            for rm in _RE_REQUIRE_ARG.finditer(body):
+                typ, field = rm.group(1).lower(), rm.group(2)
+                by_file_handler.setdefault(key, []).append((field, typ))
+            # Helper-call expansion
+            for hm in _RE_HELPER_CALL.finditer(body):
+                hname = hm.group(1)
+                if hname in helpers:
+                    for field, typ in helpers[hname]:
+                        by_file_handler.setdefault(key, []).append((field, typ))
+
+    # Dedup per (file, handler) entry
+    for k, pairs in by_file_handler.items():
         seen = set()
         deduped = []
         for fn, ty in pairs:
             if fn not in seen:
                 seen.add(fn)
                 deduped.append((fn, ty))
-        by_handler[h] = deduped
+        by_file_handler[k] = deduped
+
+    # Flatten to {handler: chain} but ONLY when there's no collision across
+    # files. Use all_pairs (all Tool_X seen, with or without requires) so
+    # collisions are detected even when one of the colliding handlers has
+    # zero Require* calls.
+    handler_file_count: Dict[str, int] = {}
+    for (_f, h) in all_pairs:
+        handler_file_count[h] = handler_file_count.get(h, 0) + 1
+    by_handler: Dict[str, List[Tuple[str, str]]] = {}
+    for (f, h), chain in by_file_handler.items():
+        if handler_file_count[h] == 1:
+            by_handler[h] = chain
+        # else: collision — caller must use file-aware lookup
+    # Attach the file-aware map as a hidden attribute on the dict for
+    # discover_chains_static() to consult.
+    by_handler["__by_file_handler__"] = by_file_handler  # type: ignore[assignment]
     return by_handler
+
+
+def discover_chains_static(src_root: Path = PLUGIN_SRC_ROOT) -> Dict[str, List[Tuple[str, str]]]:
+    """Static chain discovery: returns {method_name: [(type, field), ...]}.
+
+    Combines discover_methods() (method-name → handler-name + file) with
+    discover_required_args() (handler-name → required fields) into a single
+    method→chain map. Used by A2/A3/A4 to skip live chain-walking and avoid
+    Lane A queue saturation.
+
+    Trade-off: misses methods whose validation doesn't use Require*Field
+    helpers (custom JSON parsing). For those, returns empty list — the
+    test will fall through to "no required args" semantics.
+    """
+    handler_to_chain = discover_required_args(src_root)
+    file_aware = handler_to_chain.pop("__by_file_handler__", {})  # type: ignore[assignment]
+    out: Dict[str, List[Tuple[str, str]]] = {}
+    for m in discover_methods(src_root):
+        method = m["name"]
+        handler = m["handler"]
+        file = m["file"]
+        chain: List[Tuple[str, str]] = []
+        # Prefer file-aware lookup (correct on collision)
+        if file and handler:
+            chain = file_aware.get((file, handler), [])  # type: ignore[arg-type]
+        # Fallback: handler-only (only safe when no collision)
+        if not chain and handler:
+            chain = handler_to_chain.get(handler, [])
+        # Convert (field, type) → (type, field) to match live walker order.
+        out[method] = [(typ, field) for (field, typ) in chain]
+    return out
+
+
+# (discover_chains_static is now defined above, inline with discover_required_args).
 
 # ============================================================================
 # Pagination helper

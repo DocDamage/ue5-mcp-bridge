@@ -50,6 +50,7 @@ from mcp_test_harness import (
     TestLogger,
     call,
     cleanup_phantom_assets,
+    discover_chains_static,
     dummy_value,
     err_code,
     err_message,
@@ -204,20 +205,48 @@ def main() -> int:
     log = TestLogger(PHASE, NAME)
     crash_baseline = time.time()
 
-    # Stage 1: walk requirement chains for every method (keep-alive socket)
-    print("[A2] stage 1 — discovering required-arg chains (keep-alive)…", flush=True)
+    # Stage 1: HYBRID chain discovery
+    #
+    # Pure-static source-parse for methods where we can resolve Require*Field
+    # via the C++ source (no live calls, no Lane A queue pressure). For
+    # methods static can't resolve (custom validators, not-yet-parsed
+    # helpers), fall back to a SINGLE live probe — just enough to identify
+    # the first required field, without walking the chain to completion
+    # (which is what saturates the Lane A queue).
+    print("[A2] stage 1 — hybrid static + minimal-live chain discovery…", flush=True)
+    static_chains = discover_chains_static()
+    static_covered = sum(1 for m in methods_with_args if static_chains.get(m))
+    print(f"  static parse covered {static_covered}/{len(methods_with_args)} methods", flush=True)
+
     chains: Dict[str, List[Tuple[str, str]]] = {}
+    live_probed = 0
     with Connection() as stage1_conn:
         for idx, m in enumerate(methods_with_args):
-            chain = discover_required_chain(m, conn=stage1_conn)
-            chains[m] = chain
-            # Health only every 25 methods, not every method (perf)
-            if (idx + 1) % 25 == 0:
+            sc = static_chains.get(m, [])
+            if sc:
+                # Static parse found ≥1 required field — trust it. ZERO live calls.
+                chains[m] = sc
+                continue
+            # Static parse empty — do ONE probe to find first required field
+            # without walking further (no satisfying-and-continuing → no
+            # handler-run-to-completion → no side effects).
+            try:
+                r = stage1_conn.call_keepalive(m, {}, timeout=4.0)
+            except Exception:
+                chains[m] = []
+                continue
+            live_probed += 1
+            miss = parse_first_missing(r)
+            chains[m] = [miss] if miss else []
+            # Health every 50 methods only
+            if (idx + 1) % 50 == 0:
                 if not health(timeout=3.0):
                     log.note(f"editor died during chain discovery for {m}")
                     log.write()
                     return 2
-                print(f"  chain {idx+1}/{len(methods_with_args)} last={m} ({len(chain)} args)", flush=True)
+                print(f"  chain {idx+1}/{len(methods_with_args)} last={m} "
+                      f"(static={static_covered}, live_probed={live_probed})", flush=True)
+    log.note(f"Stage 1 — static covered {static_covered}, live probed {live_probed} methods")
     total_fields = sum(len(c) for c in chains.values())
     log.note(f"Discovered {total_fields} required fields across {len(chains)} methods")
     print(f"[A2] total required fields discovered: {total_fields}", flush=True)
