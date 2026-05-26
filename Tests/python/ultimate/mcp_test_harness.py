@@ -1353,23 +1353,27 @@ def dismiss_ue_modal_via_win32(titles: Tuple[str, ...] = KNOWN_UE_MODAL_TITLES) 
     return None
 
 
-def attempt_lane_a_recovery(label: str = "", max_dismiss_attempts: int = 3) -> bool:
+def attempt_lane_a_recovery(label: str = "", max_dismiss_attempts: int = 3,
+                              allow_editor_restart: bool = True) -> bool:
     """Auto-recovery for blocked Lane A queue.
 
-    Strategy:
+    Strategy (escalating):
       1. Confirm Lane B works (editor process alive, listener thread OK)
       2. Try dismiss_ue_modal_via_win32() up to max_dismiss_attempts times
          (multiple modals may stack, e.g. Restore + Hot Reload)
       3. Wait briefly for game thread to drain pent-up queue
-      4. Re-probe Lane A — success = True, still-dead = False
-
-    Returns True if Lane A is alive after recovery, False otherwise.
+      4. Re-probe Lane A — success = True, still-dead = continue
+      5. If allow_editor_restart: kill editor + purge autosaves + relaunch +
+         wait for Lane A. ~3 min budget. Final fallback.
+      6. Returns True if Lane A alive at any point, False otherwise.
 
     Logs each step to stderr so the user can see what happened.
     """
     if not health(timeout=3.0):
         print(f"[recovery {label}] editor unreachable on Lane B too — process dead",
               file=sys.stderr)
+        if allow_editor_restart:
+            return _kill_and_relaunch_editor(label=label)
         return False
     print(f"[recovery {label}] Lane A dead but Lane B alive → likely modal blocking game thread",
           file=sys.stderr)
@@ -1380,7 +1384,7 @@ def attempt_lane_a_recovery(label: str = "", max_dismiss_attempts: int = 3) -> b
         if dismissed:
             print(f"[recovery {label}] attempt {attempt}: dismissed modal '{dismissed}'",
                   file=sys.stderr)
-            time.sleep(1.5)  # let game thread drain
+            time.sleep(1.5)
             if assert_lane_a_alive(timeout_s=8.0):
                 print(f"[recovery {label}] Lane A RECOVERED after dismiss '{dismissed}'",
                       file=sys.stderr)
@@ -1389,12 +1393,103 @@ def attempt_lane_a_recovery(label: str = "", max_dismiss_attempts: int = 3) -> b
             print(f"[recovery {label}] attempt {attempt}: no known modal title found",
                   file=sys.stderr)
             break
-    # Final probe — maybe game thread just needed time
     print(f"[recovery {label}] final liveness check (15s timeout)…", file=sys.stderr)
     if assert_lane_a_alive(timeout_s=15.0):
         print(f"[recovery {label}] Lane A recovered (delayed drain)", file=sys.stderr)
         return True
+    if allow_editor_restart:
+        print(f"[recovery {label}] modal dismiss + wait failed → kill + relaunch editor",
+              file=sys.stderr)
+        return _kill_and_relaunch_editor(label=label)
     print(f"[recovery {label}] Lane A still dead — manual intervention required",
+          file=sys.stderr)
+    return False
+
+
+# ============================================================================
+# Last-resort: kill editor, purge state, relaunch, wait for Lane A
+# ============================================================================
+
+_UE_EXE_PATH = "D:/Epic Games/UE_5.7/Engine/Binaries/Win64/UnrealEditor.exe"
+_FATUM_UPROJECT = "D:/Unreal Engine Projects/FatumGame/FatumGame.uproject"
+
+
+def _kill_and_relaunch_editor(label: str = "", launch_wait_s: float = 240.0,
+                                lane_a_wait_s: float = 60.0) -> bool:
+    """Nuclear recovery: kill editor, purge transient state, relaunch, wait.
+
+    Steps:
+      1. taskkill /F /IM UnrealEditor.exe /T
+      2. rm -rf Saved/Autosaves (the modal trigger)
+      3. rm -rf Content/PhT_RoundTrip (A5 leftovers)
+      4. Spawn editor as detached background process
+      5. wait_for_editor() up to launch_wait_s for Lane B
+      6. Probe Lane A up to lane_a_wait_s for first response
+      7. If a modal appears post-launch (Restore Packages from killed editor),
+         dismiss via Win32
+
+    Returns True if Lane A alive after relaunch, False on any step failure.
+    """
+    if os.name != "nt":
+        return False
+    print(f"[recovery {label}] killing UnrealEditor.exe + child processes…",
+          file=sys.stderr)
+    try:
+        import subprocess
+        subprocess.run(["taskkill", "/F", "/IM", "UnrealEditor.exe", "/T"],
+                       capture_output=True, timeout=20)
+        time.sleep(3.0)  # let process tree die
+    except Exception as e:
+        print(f"[recovery {label}] taskkill failed: {e}", file=sys.stderr)
+        return False
+    # Purge transient state
+    project_dir = Path(_FATUM_UPROJECT).parent
+    for sub in ("Saved/Autosaves", "Content/PhT_RoundTrip", "Content/MCPTest"):
+        target = project_dir / sub
+        if target.exists():
+            try:
+                import shutil
+                shutil.rmtree(target, ignore_errors=True)
+                print(f"[recovery {label}] purged {target}", file=sys.stderr)
+            except Exception:
+                pass
+    # Relaunch editor as fully detached background process
+    print(f"[recovery {label}] launching editor…", file=sys.stderr)
+    try:
+        import subprocess
+        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP so editor outlives this script
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        subprocess.Popen(
+            [_UE_EXE_PATH, _FATUM_UPROJECT],
+            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+    except Exception as e:
+        print(f"[recovery {label}] editor launch failed: {e}", file=sys.stderr)
+        return False
+    # Wait for Lane B (TCP listener)
+    print(f"[recovery {label}] waiting up to {launch_wait_s:.0f}s for Lane B…",
+          file=sys.stderr)
+    if not wait_for_editor(timeout=launch_wait_s, poll_s=3.0):
+        print(f"[recovery {label}] editor never came up — abort", file=sys.stderr)
+        return False
+    print(f"[recovery {label}] Lane B up. Probing Lane A…", file=sys.stderr)
+    # First Lane A probe — may have modal if killed editor had unsaved
+    deadline = time.monotonic() + lane_a_wait_s
+    while time.monotonic() < deadline:
+        if assert_lane_a_alive(timeout_s=6.0):
+            print(f"[recovery {label}] Lane A ALIVE after relaunch", file=sys.stderr)
+            return True
+        # Try modal dismiss (Restore Packages may appear since taskkill killed editor)
+        dismissed = dismiss_ue_modal_via_win32()
+        if dismissed:
+            print(f"[recovery {label}] post-launch modal dismissed: '{dismissed}'",
+                  file=sys.stderr)
+            time.sleep(2.0)
+        time.sleep(3.0)
+    print(f"[recovery {label}] Lane A still dead {lane_a_wait_s:.0f}s after relaunch — giving up",
           file=sys.stderr)
     return False
 
