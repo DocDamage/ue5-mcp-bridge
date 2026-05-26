@@ -51,10 +51,13 @@ NAME = "pie_thrash"
 
 
 def _is_pie_running() -> bool:
+    """pie.is_running returns result.running (NOT is_running). Accept either field
+    name for future-proofing — current Bridge spelling is 'running'."""
     r = call("pie.is_running", {}, timeout=4.0)
-    if is_ok(r):
-        return bool(r.get("result", {}).get("is_running"))
-    return False
+    if not is_ok(r):
+        return False
+    res = r.get("result", {}) or {}
+    return bool(res.get("running") or res.get("is_running"))
 
 
 def _safe_stop() -> None:
