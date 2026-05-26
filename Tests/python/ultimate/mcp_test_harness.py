@@ -1196,32 +1196,239 @@ def assert_lane_a_alive(timeout_s: float = 6.0) -> bool:
     return True
 
 
+# ============================================================================
+# Windows-only: autonomous UE modal dismissal via Win32 API
+# ============================================================================
+#
+# When Lane A queue is dead but Lane B is alive, the editor is almost certainly
+# blocked on a Slate modal (game thread suspended). UE Slate modals ARE proper
+# OS-level HWNDs in UE5 — they appear in EnumWindows. We can find them by title
+# and dismiss by either:
+#   1. Sending WM_CLOSE (clean close — most modals treat as Cancel/Default)
+#   2. Finding the default button HWND and sending BM_CLICK
+#   3. SetForegroundWindow + simulated Enter keystroke
+#
+# Strategy: WM_CLOSE first (cleanest), fall back to enter keystroke.
+#
+# Known modal titles (collected from real session experience):
+#   - "Restore Packages"             (autosave recovery after dirty shutdown)
+#   - "Save Changes?"                (unsaved-asset prompt)
+#   - "Confirm"                       (generic confirmation)
+#   - "Unsaved Changes"
+#   - "Hot Reload"                    (Live Coding patch confirmation)
+#   - "Compile Failed"                (BP compile error popup)
+#   - "Asset Validation"
+#   - "Engine is processing"          (during heavy startup)
+
+KNOWN_UE_MODAL_TITLES = (
+    "Restore Packages",
+    "Save Changes?",
+    "Save Changes",
+    "Unsaved Changes",
+    "Confirm",
+    "Hot Reload",
+    "Compile Failed",
+    "Asset Validation",
+    "Outdated Asset",
+    "Source Control",
+    "Crash Reporter",
+)
+
+
+def dismiss_ue_modal_via_win32(titles: Tuple[str, ...] = KNOWN_UE_MODAL_TITLES) -> Optional[str]:
+    """Find any UE Slate modal by title and dismiss it via Win32 API.
+
+    Algorithm (in escalating force order):
+      1. FindWindowW for each candidate title
+      2. If found, try in sequence until something works:
+         a. PostMessage WM_CLOSE — most Slate modals treat as cancel/default
+         b. Enumerate children, find button with "Skip"/"Don't Save"/etc.
+            label, PostMessage BM_CLICK
+         c. PostMessage WM_KEYDOWN/WM_KEYUP with VK_RETURN directly to modal
+         d. SetForegroundWindow + AttachThreadInput + keybd_event(Enter)
+            (most invasive — only used as last resort)
+      3. Returns title of dismissed modal, or None if none found.
+
+    Windows-only. On non-Windows platforms returns None silently.
+
+    Note: foreground-focus tricks are unreliable from non-foreground
+    processes per Windows AllowSetForegroundWindow rules. WM_CLOSE and
+    PostMessage are reliable because they don't depend on focus.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError:
+        return None
+
+    user32 = ctypes.windll.user32
+
+    # Constants we need
+    WM_CLOSE = 0x0010
+    WM_KEYDOWN = 0x0100
+    WM_KEYUP = 0x0101
+    BM_CLICK = 0x00F5
+    VK_RETURN = 0x0D
+    VK_ESCAPE = 0x1B
+
+    # Common "dismiss" button labels in UE modals
+    DISMISS_LABELS = (
+        "Skip Restore", "Don't Save", "No", "Cancel", "Close",
+        "Skip", "Discard", "Ignore", "OK",
+    )
+
+    EnumChildProcType = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    for title in titles:
+        hwnd = user32.FindWindowW(None, title)
+        if not hwnd:
+            continue
+
+        # === STAGE 1: enumerate child controls, click "dismiss"-style button ===
+        found_button: List[int] = [0]
+        def _enum_cb(child_hwnd, lparam):
+            length = user32.GetWindowTextLengthW(child_hwnd)
+            if length <= 0:
+                return True
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(child_hwnd, buf, length + 1)
+            text = buf.value.strip()
+            for label in DISMISS_LABELS:
+                if label == text or label in text:
+                    found_button[0] = child_hwnd
+                    return False  # stop
+            return True
+        try:
+            user32.EnumChildWindows(hwnd, EnumChildProcType(_enum_cb), 0)
+        except Exception:
+            pass
+        if found_button[0]:
+            # PostMessage BM_CLICK to the button
+            user32.PostMessageW(found_button[0], BM_CLICK, 0, 0)
+            time.sleep(0.6)
+            # Verify modal gone
+            if not user32.FindWindowW(None, title):
+                return f"{title} (BM_CLICK)"
+
+        # === STAGE 2: PostMessage WM_KEYDOWN/UP Enter to modal HWND ===
+        user32.PostMessageW(hwnd, WM_KEYDOWN, VK_RETURN, 0)
+        user32.PostMessageW(hwnd, WM_KEYUP, VK_RETURN, 0)
+        time.sleep(0.5)
+        if not user32.FindWindowW(None, title):
+            return f"{title} (WM_KEYDOWN Enter)"
+
+        # === STAGE 3: WM_CLOSE (treats as Cancel for many Slate dialogs) ===
+        user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+        time.sleep(0.5)
+        if not user32.FindWindowW(None, title):
+            return f"{title} (WM_CLOSE)"
+
+        # === STAGE 4: AttachThreadInput + SetForegroundWindow + keybd_event ===
+        # This is the heavy hammer — requires bringing UE foreground for real.
+        kernel32 = ctypes.windll.kernel32
+        try:
+            target_tid = user32.GetWindowThreadProcessId(hwnd, None)
+            current_tid = kernel32.GetCurrentThreadId()
+            attached = bool(user32.AttachThreadInput(current_tid, target_tid, True))
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+            user32.SetFocus(hwnd)
+            time.sleep(0.3)
+            user32.keybd_event(VK_RETURN, 0, 0, 0)
+            time.sleep(0.05)
+            user32.keybd_event(VK_RETURN, 0, 2, 0)
+            time.sleep(0.6)
+            if attached:
+                user32.AttachThreadInput(current_tid, target_tid, False)
+            if not user32.FindWindowW(None, title):
+                return f"{title} (AttachThreadInput + keybd)"
+        except Exception:
+            pass
+
+        # Still not dismissed — report partial info
+        return f"{title} (FOUND but DISMISS FAILED)"
+    return None
+
+
+def attempt_lane_a_recovery(label: str = "", max_dismiss_attempts: int = 3) -> bool:
+    """Auto-recovery for blocked Lane A queue.
+
+    Strategy:
+      1. Confirm Lane B works (editor process alive, listener thread OK)
+      2. Try dismiss_ue_modal_via_win32() up to max_dismiss_attempts times
+         (multiple modals may stack, e.g. Restore + Hot Reload)
+      3. Wait briefly for game thread to drain pent-up queue
+      4. Re-probe Lane A — success = True, still-dead = False
+
+    Returns True if Lane A is alive after recovery, False otherwise.
+
+    Logs each step to stderr so the user can see what happened.
+    """
+    if not health(timeout=3.0):
+        print(f"[recovery {label}] editor unreachable on Lane B too — process dead",
+              file=sys.stderr)
+        return False
+    print(f"[recovery {label}] Lane A dead but Lane B alive → likely modal blocking game thread",
+          file=sys.stderr)
+    print(f"[recovery {label}] attempting Win32 modal dismissal (up to {max_dismiss_attempts}x)…",
+          file=sys.stderr)
+    for attempt in range(1, max_dismiss_attempts + 1):
+        dismissed = dismiss_ue_modal_via_win32()
+        if dismissed:
+            print(f"[recovery {label}] attempt {attempt}: dismissed modal '{dismissed}'",
+                  file=sys.stderr)
+            time.sleep(1.5)  # let game thread drain
+            if assert_lane_a_alive(timeout_s=8.0):
+                print(f"[recovery {label}] Lane A RECOVERED after dismiss '{dismissed}'",
+                      file=sys.stderr)
+                return True
+        else:
+            print(f"[recovery {label}] attempt {attempt}: no known modal title found",
+                  file=sys.stderr)
+            break
+    # Final probe — maybe game thread just needed time
+    print(f"[recovery {label}] final liveness check (15s timeout)…", file=sys.stderr)
+    if assert_lane_a_alive(timeout_s=15.0):
+        print(f"[recovery {label}] Lane A recovered (delayed drain)", file=sys.stderr)
+        return True
+    print(f"[recovery {label}] Lane A still dead — manual intervention required",
+          file=sys.stderr)
+    return False
+
+
 def preflight(label: str = "") -> bool:
     """Run before any phase script's main loop.
 
     Returns True if editor is fully usable (both Lane A and Lane B). False
-    if blocked (likely Restore Packages or similar modal). Caller should
-    abort phase if False, instructing the user to dismiss the dialog.
+    if blocked AFTER auto-recovery attempted (rare).
+
+    Auto-recovery flow:
+      1. Probe health() — fail = process dead, return False
+      2. Probe Lane A — pass = OK, fail = try modal dismiss via Win32
+      3. After dismiss: re-probe Lane A — pass = recovered, fail = report
 
     Side-effects:
       - Disables autosave for the session (prevents Restore-Packages on
-        next launch if this run crashes).
+        next launch if this run crashes)
+      - May click "Skip Restore" / "Don't Save" / etc. on UE modals
     """
     if not health():
-        print(f"[preflight {label}] editor unreachable", file=sys.stderr)
+        print(f"[preflight {label}] editor unreachable (no Lane B)", file=sys.stderr)
         return False
-    # Lane B works (we got health). Now probe Lane A.
+    # Lane B works. Probe Lane A.
     if not assert_lane_a_alive(timeout_s=8.0):
-        print(f"[preflight {label}] Lane A queue DEAD — editor likely blocked by",
-              file=sys.stderr)
-        print("    a modal dialog (Restore Packages?, Save Changes?, etc.).",
-              file=sys.stderr)
-        print("    Dismiss the dialog in the editor UI and re-run.", file=sys.stderr)
-        print(f"    (Phantom autosaves on disk that re-trigger the dialog can be",
-              file=sys.stderr)
-        print(f"    purged via: rm -rf <ProjectDir>/Saved/Autosaves/Game)",
-              file=sys.stderr)
-        return False
+        # Try autonomous recovery
+        if not attempt_lane_a_recovery(label=label):
+            print(f"[preflight {label}] Lane A queue DEAD — auto-recovery failed.",
+                  file=sys.stderr)
+            print(f"    Manual steps: focus editor window, dismiss any modal,",
+                  file=sys.stderr)
+            print(f"    or kill editor + rm -rf <Project>/Saved/Autosaves/Game",
+                  file=sys.stderr)
+            return False
     # Defence: suppress autosave for this session so a crash mid-run doesn't
     # cause the Restore Packages dialog to block next launch.
     disable_autosave()
