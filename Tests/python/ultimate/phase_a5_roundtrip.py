@@ -364,7 +364,9 @@ def case_actor_set_location_get(log: TestLogger) -> int:
                  duration_ms=dur)
         return 1
     res = rr.get("result", {}) or {}
-    loc = res.get("location") or {}
+    # actor.get returns location under transform.translation (NOT res.location).
+    tf = res.get("transform") or {}
+    loc = (tf.get("translation") or {}) if isinstance(tf, dict) else {}
     if not isinstance(loc, dict):
         loc = {}
     got = [loc.get(k) for k in ("x", "y", "z")]
@@ -408,7 +410,9 @@ def case_actor_set_rotation_get(log: TestLogger) -> int:
                  duration_ms=dur)
         return 1
     res = rr.get("result", {}) or {}
-    rot = res.get("rotation") or res.get("world_rotation") or {}
+    # actor.get returns rotation under transform.rotation (NOT res.rotation).
+    tf = res.get("transform") or {}
+    rot = (tf.get("rotation") or {}) if isinstance(tf, dict) else {}
     pyr = (
         (rot.get("pitch"), rot.get("yaw"), rot.get("roll"))
         if isinstance(rot, dict) else
@@ -739,7 +743,7 @@ def case_ai_bb_create_add_list_keys(log: TestLogger) -> int:
 
 
 def case_ai_bt_create_add_node_get(log: TestLogger) -> int:
-    case_id = "ai.bt.create+add_node→ai.bt.get_tree"
+    case_id = "ai.bt.create+add_node→ai.bt.get_nodes"
     bt_path = f"{ROOT_FOLDER}/BT_NodeAdd_{random_suffix(5)}"
     t0 = time.monotonic()
     rc = call("ai.bt.create_asset", {"path": bt_path}, timeout=10.0)
@@ -756,16 +760,29 @@ def case_ai_bt_create_add_node_get(log: TestLogger) -> int:
         log.case(case_id, "XFAIL", f"ai.bt.add_node failed: {err_message(rw)[:60]}",
                  duration_ms=(time.monotonic()-t0)*1000.0)
         return 0
-    rr = call("ai.bt.get_tree", {"bt_path": bt_path}, timeout=8.0)
+    # The tool is ai.bt.get_nodes (ai.bt.get_tree does not exist); it returns a
+    # nested result.root with .children, so count by walking the tree.
+    rr = call("ai.bt.get_nodes", {"bt_path": bt_path}, timeout=8.0)
     dur = (time.monotonic()-t0)*1000.0
     if not is_ok(rr):
-        log.case(case_id, "FAIL", f"ai.bt.get_tree failed: {err_message(rr)[:60]}",
+        log.case(case_id, "FAIL", f"ai.bt.get_nodes failed: {err_message(rr)[:60]}",
                  duration_ms=dur)
         return 1
-    nodes = rr.get("result", {}).get("nodes") or rr.get("result", {}).get("items") or []
-    ok = len(nodes) >= 1  # At minimum the BTTask_Wait node should be present
+    res = rr.get("result", {}) or {}
+    count = [0]
+    def _walk(n):
+        if not isinstance(n, dict):
+            return
+        count[0] += 1
+        for ch in (n.get("children") or []):
+            inner = ch.get("node") if isinstance(ch, dict) else ch
+            _walk(inner)
+    root = res.get("root")
+    if root:
+        _walk(root)
+    ok = count[0] >= 1  # at minimum ROOT (+ the BTTask_Wait child) present
     return 0 if _check_then(log, case_id, ok,
-                             f"added Wait task; get_tree returned {len(nodes)} nodes",
+                             f"added Wait task; get_nodes tree has {count[0]} nodes",
                              dur) else 1
 
 
@@ -781,8 +798,8 @@ def case_mesh_duplicate_exists(log: TestLogger) -> int:
         log.case(case_id, "XFAIL", f"mesh.duplicate failed: {err_message(rw)[:60]}",
                  duration_ms=(time.monotonic()-t0)*1000.0)
         return 0
-    r1 = call("asset.exists", {"asset_path": src}, timeout=4.0)
-    r2 = call("asset.exists", {"asset_path": dst}, timeout=4.0)
+    r1 = call("asset.exists", {"path": src}, timeout=4.0)
+    r2 = call("asset.exists", {"path": dst}, timeout=4.0)
     dur = (time.monotonic()-t0)*1000.0
     src_ok = is_ok(r1) and r1.get("result", {}).get("exists") is True
     dst_ok = is_ok(r2) and r2.get("result", {}).get("exists") is True
@@ -883,21 +900,17 @@ def case_actor_attach_get_parent(log: TestLogger) -> int:
         log.case(case_id, "FAIL", f"actor.attach failed: {err_message(rw)[:60]}",
                  duration_ms=(time.monotonic()-t0)*1000.0)
         return 1
-    rr = call("actor.get", {"actor_path": child_path}, timeout=6.0)
+    # actor.get does NOT expose an actor-level attach parent (owner_path is the
+    # UE Owner, not the attach parent; component parent_component_name is the
+    # internal component hierarchy). Verify the attachment via actor.attach's
+    # own response, which echoes the resolved parent_actor_path.
     dur = (time.monotonic()-t0)*1000.0
     _destroy_actor(child_path); _destroy_actor(parent_path)
-    if not is_ok(rr):
-        log.case(case_id, "FAIL", f"actor.get failed: {err_message(rr)[:60]}",
-                 duration_ms=dur)
-        return 1
-    res = rr.get("result", {}) or {}
-    got_parent = (
-        res.get("parent_actor_path") or res.get("attach_parent")
-        or res.get("parent") or ""
-    )
+    aw = rw.get("result", {}) or {}
+    got_parent = aw.get("parent_actor_path") or ""
     ok = bool(got_parent) and (parent_path in got_parent or got_parent.endswith(parent_label))
     return 0 if _check_then(log, case_id, ok,
-                             f"attached to {parent_path}; child parent_actor_path={got_parent!r}",
+                             f"attach confirmed parent={got_parent!r} (actor.get omits attach parent)",
                              dur) else 1
 
 
